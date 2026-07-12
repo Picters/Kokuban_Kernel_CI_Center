@@ -1165,7 +1165,7 @@ fn build_oot_module_zip(module_zip_name: &str, version_str: &str) -> Result<bool
     )?;
     fs::write(
         stage.join("customize.sh"),
-        "#!/sbin/sh\nSKIPUNZIP=0\nui_print \"- NetHunter out-of-tree kernel modules\"\nKO=$(ls \"$MODPATH/system/lib/modules/\"*.ko 2>/dev/null | wc -l)\nui_print \"- staging $KO modules\"\nset_perm_recursive \"$MODPATH\" 0 0 0755 0644\nui_print \"- reboot to apply; load with modprobe/insmod as needed\"\n",
+        "#!/sbin/sh\nSKIPUNZIP=0\nui_print \"- Picters NetHunter OOT modules\"\nKO=$(ls \"$MODPATH/system/lib/modules/\"*.ko 2>/dev/null | wc -l)\nui_print \"- $KO drivers staged\"\nset_perm_recursive \"$MODPATH\" 0 0 0755 0644\nfor s in service.sh inject.sh action.sh nh-modules.sh; do [ -f \"$MODPATH/$s\" ] && chmod 0755 \"$MODPATH/$s\"; done\nui_print \"- Non-Wi-Fi drivers auto-load at boot\"\nui_print \"- Wi-Fi injection: module Action / Picters Manager WebUI\"\n",
     )?;
     fs::write(
         stage.join("META-INF/com/google/android/updater-script"),
@@ -1183,24 +1183,12 @@ fn build_oot_module_zip(module_zip_name: &str, version_str: &str) -> Result<bool
         stage.join("webroot/index.html"),
         include_str!("picters_webui.html"),
     )?;
-    fs::write(
-        stage.join("action.sh"),
-        "#!/system/bin/sh\n\
-         # Picters injection toggle (Action fallback for managers without WebUI).\n\
-         KMOD=/system/lib/modules\n\
-         ADAPTERS=\"88XXau 8188eu 8814au 88x2bu rtl8xxxu\"\n\
-         if grep -q '^qca_cld3_peach_v2 ' /proc/modules; then\n\
-         \x20 echo \"Switching to INJECTION mode (internal Wi-Fi OFF)...\"\n\
-         \x20 svc wifi disable; sleep 2\n\
-         \x20 rmmod qca_cld3_peach_v2 2>/dev/null; rmmod mac80211 2>/dev/null; rmmod cfg80211 2>/dev/null\n\
-         \x20 insmod $KMOD/cfg80211.ko && insmod $KMOD/mac80211.ko 2>/dev/null\n\
-         \x20 for a in $ADAPTERS; do [ -f $KMOD/$a.ko ] && insmod $KMOD/$a.ko 2>/dev/null; done\n\
-         \x20 echo \"Injection ON. Plug your adapter and run: iw dev\"\n\
-         \x20 echo \"Reboot to return to internal Wi-Fi.\"\n\
-         else\n\
-         \x20 echo \"Injection mode is ON. Reboot to return to internal Wi-Fi.\"\n\
-         fi\n",
-    )?;
+    // Boot auto-load of the non-Wi-Fi drivers (CAN/BT/SDR/serial/NTFS/USB-eth) via a
+    // KernelSU/Magisk service.sh, plus the injection toggle scripts + Action fallback.
+    fs::write(stage.join("nh-modules.sh"), include_str!("mod_nh_modules.sh"))?;
+    fs::write(stage.join("service.sh"), include_str!("mod_service.sh"))?;
+    fs::write(stage.join("inject.sh"), include_str!("mod_inject.sh"))?;
+    fs::write(stage.join("action.sh"), include_str!("mod_action.sh"))?;
 
     let out_zip = cwd.join(module_zip_name);
     if out_zip.exists() {

@@ -145,17 +145,8 @@ function render(qcaUp, loaded, cnt){
 async function toInjection(){
   const act=$("action"); act.disabled=true; act.innerHTML='<span class="spin"></span>Switching…';
   log("Switching to injection mode…\n");
-  const script =
-    "svc wifi disable; sleep 2;"+
-    "rmmod qca_cld3_peach_v2 2>/dev/null;"+
-    "rmmod mac80211 2>/dev/null;"+
-    "rmmod cfg80211 2>/dev/null;"+
-    "insmod /system/lib/modules/cfg80211.ko;"+
-    "insmod /system/lib/modules/mac80211.ko 2>/dev/null;"+
-    "for a in "+ADAPTERS.join(" ")+"; do [ -f /system/lib/modules/$a.ko ] && insmod /system/lib/modules/$a.ko 2>/dev/null; done;"+
-    "echo '--- loaded ---'; grep -E '^(cfg80211|88XXau|8188eu|8814au|88x2bu|rtl8xxxu) ' /proc/modules";
-  const r = await exec(script);
-  log("Done.\n"+(r.stdout||"")+(r.stderr?("\n"+r.stderr):""));
+  const r = await exec("sh /data/adb/modules/nethunter-oot-modules/inject.sh on 2>&1");
+  log((r.stdout||"")+(r.stderr?("\n"+r.stderr):"") || "done");
   toast("Injection mode ON — plug your adapter");
   await detect();
 }
