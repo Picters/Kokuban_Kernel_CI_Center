@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Picters Manager</title>
+<style>
+  :root{
+    --bg:#0b0f14; --card:#141b24; --card2:#1b2430; --line:#26313f;
+    --tx:#e6edf3; --mut:#8b98a8; --acc:#3ddc84; --acc2:#2bb673;
+    --inj:#ff7a45; --inj2:#e5602b; --danger:#ff5a5a;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;background:var(--bg);color:var(--tx);
+    font-family:-apple-system,"Roboto","Segoe UI",system-ui,sans-serif}
+  body{padding:max(20px,env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom));
+    max-width:520px;margin:0 auto;min-height:100vh}
+  header{display:flex;align-items:center;gap:12px;margin:8px 2px 22px}
+  .logo{width:44px;height:44px;border-radius:12px;flex:0 0 auto;
+    background:linear-gradient(135deg,var(--acc),#2b8fff);display:grid;place-items:center;
+    font-weight:800;color:#04120a;font-size:20px}
+  h1{font-size:19px;margin:0;letter-spacing:.2px}
+  .sub{font-size:12.5px;color:var(--mut);margin-top:2px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;
+    padding:18px;margin-bottom:14px}
+  .mode{display:flex;align-items:center;gap:14px}
+  .dot{width:14px;height:14px;border-radius:50%;flex:0 0 auto;box-shadow:0 0 0 4px rgba(255,255,255,.04)}
+  .dot.on{background:var(--acc);box-shadow:0 0 14px var(--acc)}
+  .dot.inj{background:var(--inj);box-shadow:0 0 14px var(--inj)}
+  .dot.unk{background:var(--mut)}
+  .mode .t{font-size:16.5px;font-weight:700}
+  .mode .d{font-size:12.5px;color:var(--mut);margin-top:2px}
+  .row{display:flex;justify-content:space-between;gap:10px;padding:9px 0;
+    border-top:1px solid var(--line);font-size:13.5px}
+  .row:first-of-type{border-top:0}
+  .row .k{color:var(--mut)} .row .v{font-weight:600;text-align:right}
+  .v.ok{color:var(--acc)} .v.no{color:var(--mut)}
+  button{width:100%;border:0;border-radius:13px;padding:15px;font-size:15.5px;font-weight:700;
+    color:#04120a;cursor:pointer;transition:.15s transform,.15s filter;font-family:inherit}
+  button:active{transform:scale(.985)}
+  button[disabled]{filter:grayscale(.5) brightness(.7);cursor:default}
+  .btn-inj{background:linear-gradient(135deg,var(--inj),var(--inj2));color:#160a04}
+  .btn-restore{background:linear-gradient(135deg,var(--acc),var(--acc2))}
+  .btn-reboot{background:var(--card2);border:1px solid var(--line);color:var(--mut)}
+  .hint{font-size:12px;color:var(--mut);margin:10px 2px 0;line-height:1.5}
+  .adapters{display:flex;flex-wrap:wrap;gap:7px;margin-top:4px}
+  .chip{font-size:11.5px;padding:5px 9px;border-radius:8px;background:var(--card2);
+    border:1px solid var(--line);color:var(--mut)}
+  .chip.up{color:var(--acc);border-color:rgba(61,220,132,.4)}
+  pre{background:#080c11;border:1px solid var(--line);border-radius:11px;padding:12px;
+    font-size:11.5px;color:#b9c6d6;white-space:pre-wrap;word-break:break-word;
+    max-height:180px;overflow:auto;margin:12px 0 0;display:none}
+  pre.show{display:block}
+  .spin{display:inline-block;width:15px;height:15px;border:2.5px solid rgba(0,0,0,.25);
+    border-top-color:#04120a;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-3px;margin-right:8px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .foot{text-align:center;color:var(--mut);font-size:11.5px;margin-top:16px}
+</style>
+</head>
+<body>
+  <header>
+    <div class="logo">P</div>
+    <div>
+      <h1>Picters Manager</h1>
+      <div class="sub">Xiaomi 17 Series · NetHunter kernel</div>
+    </div>
+  </header>
+
+  <div class="card">
+    <div class="mode">
+      <span id="dot" class="dot unk"></span>
+      <div>
+        <div class="t" id="modeTitle">Checking…</div>
+        <div class="d" id="modeDesc">Reading current Wi-Fi stack</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row"><span class="k">Active cfg80211</span><span class="v" id="cfgWho">—</span></div>
+    <div class="row"><span class="k">Internal Wi-Fi (qca_cld3)</span><span class="v" id="qca">—</span></div>
+    <div class="row"><span class="k">Injection adapters staged</span><span class="v" id="staged">—</span></div>
+    <div class="adapters" id="adapters"></div>
+  </div>
+
+  <button id="action" disabled>…</button>
+  <div class="hint" id="hint"></div>
+  <pre id="log"></pre>
+
+  <div class="foot">Picters · one cfg80211 at a time — internal Wi-Fi &amp; injection don't run together</div>
+
+<script>
+const ADAPTERS = ["88XXau","8188eu","8814au","88x2bu","rtl8xxxu"];
+const $ = id => document.getElementById(id);
+let mode = "unknown";
+
+// KernelSU WebUI exec bridge (callback -> Promise), compatible across KSU forks
+function exec(cmd, opts={}){
+  return new Promise((resolve)=>{
+    const cb = "cb_"+Date.now()+"_"+Math.floor(Math.random()*1e6);
+    window[cb] = (errno, stdout, stderr)=>{ delete window[cb]; resolve({errno:errno|0, stdout:stdout||"", stderr:stderr||""}); };
+    try{ ksu.exec(cmd, JSON.stringify(opts), cb); }
+    catch(e){ delete window[cb]; resolve({errno:1, stdout:"", stderr:"no ksu bridge: "+e}); }
+  });
+}
+function toast(m){ try{ ksu.toast(m); }catch(e){} }
+function log(t, show=true){ const el=$("log"); el.textContent=t; el.classList.toggle("show",show); }
+
+async function detect(){
+  const q = (await exec("grep -c '^qca_cld3_peach_v2 ' /proc/modules")).stdout.trim();
+  const qcaUp = q === "1";
+  // which adapters are currently loaded
+  const lsmod = (await exec("cat /proc/modules")).stdout;
+  const loaded = ADAPTERS.filter(a => new RegExp("^"+a+" ","m").test(lsmod));
+  // how many .ko are staged
+  const cnt = (await exec("ls /system/lib/modules/*.ko 2>/dev/null | wc -l")).stdout.trim();
+
+  mode = qcaUp ? "internal" : (loaded.length ? "injection" : "injection");
+  render(qcaUp, loaded, cnt);
+}
+
+function render(qcaUp, loaded, cnt){
+  const dot=$("dot"), title=$("modeTitle"), desc=$("modeDesc"), act=$("action"), hint=$("hint");
+  $("qca").className = "v "+(qcaUp?"ok":"no"); $("qca").textContent = qcaUp?"loaded":"unloaded";
+  $("cfgWho").textContent = qcaUp ? "vendor (Qualcomm)" : "kernel (NetHunter)";
+  $("cfgWho").className = "v "+(qcaUp?"":"ok");
+  $("staged").textContent = (cnt||"0")+" modules";
+  const ad=$("adapters"); ad.innerHTML="";
+  ADAPTERS.forEach(a=>{ const c=document.createElement("span");
+    c.className="chip"+(loaded.includes(a)?" up":""); c.textContent=a+(loaded.includes(a)?" ●":""); ad.appendChild(c); });
+
+  if(qcaUp){
+    dot.className="dot on"; title.textContent="Internal Wi-Fi active";
+    desc.textContent="Vendor cfg80211 loaded — normal Wi-Fi works";
+    act.className="btn-inj"; act.textContent="⚡ Switch to Injection Mode"; act.disabled=false;
+    hint.textContent="Unloads vendor Wi-Fi and loads the kernel cfg80211 + adapter drivers. Internal Wi-Fi turns OFF. Plug your USB adapter after switching.";
+  }else{
+    dot.className="dot inj"; title.textContent="Injection Mode active";
+    desc.textContent="Kernel cfg80211 loaded — external adapters work";
+    act.className="btn-reboot"; act.textContent="↻ Reboot to disable injection"; act.disabled=false;
+    hint.textContent="Reboot needed to switch back to internal Wi-Fi (see README for why).";
+  }
+}
+
+async function toInjection(){
+  const act=$("action"); act.disabled=true; act.innerHTML='<span class="spin"></span>Switching…';
+  log("Switching to injection mode…\n");
+  const script =
+    "svc wifi disable; sleep 2;"+
+    "rmmod qca_cld3_peach_v2 2>/dev/null;"+
+    "rmmod mac80211 2>/dev/null;"+
+    "rmmod cfg80211 2>/dev/null;"+
+    "insmod /system/lib/modules/cfg80211.ko;"+
+    "insmod /system/lib/modules/mac80211.ko 2>/dev/null;"+
+    "for a in "+ADAPTERS.join(" ")+"; do [ -f /system/lib/modules/$a.ko ] && insmod /system/lib/modules/$a.ko 2>/dev/null; done;"+
+    "echo '--- loaded ---'; grep -E '^(cfg80211|88XXau|8188eu|8814au|88x2bu|rtl8xxxu) ' /proc/modules";
+  const r = await exec(script);
+  log("Done.\n"+(r.stdout||"")+(r.stderr?("\n"+r.stderr):""));
+  toast("Injection mode ON — plug your adapter");
+  await detect();
+}
+
+async function restore(){
+  if(!confirm("Reboot now to disable injection mode?")){ toast("Staying in injection mode"); return; }
+  toast("Rebooting…");
+  await exec("reboot");
+}
+
+$("action").addEventListener("click", ()=>{ mode==="internal" ? toInjection() : restore(); });
+detect();
+</script>
+</body>
+</html>

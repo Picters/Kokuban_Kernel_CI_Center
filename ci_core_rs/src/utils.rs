@@ -1,0 +1,478 @@
+use anyhow::{Context, Result, anyhow};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::env;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
+
+use crate::config::{
+    AnyKernelConfig, AnyKernelConfigMap, GlobalConfig, ProjectConfig, ProjectsMap,
+};
+
+pub fn get_root_dir() -> PathBuf {
+    if let Ok(path) = env::var("CI_CENTRAL_ROOT") {
+        return PathBuf::from(path);
+    }
+
+    if let Ok(current_dir) = env::current_dir() {
+        for candidate in current_dir.ancestors() {
+            if candidate.join("configs/projects.json").is_file() {
+                return candidate.to_path_buf();
+            }
+        }
+    }
+
+    PathBuf::from(".")
+}
+
+pub fn get_config_path() -> PathBuf {
+    get_root_dir().join("configs/projects.json")
+}
+
+pub fn get_anykernel_config_path() -> PathBuf {
+    get_root_dir().join("configs/anykernel_configs.json")
+}
+
+pub fn get_upstream_path() -> PathBuf {
+    get_root_dir().join("configs/upstream_commits.json")
+}
+
+pub fn get_workspace_dir() -> PathBuf {
+    get_root_dir().join("kernel_workspace")
+}
+
+pub fn get_template_path(name: &str) -> PathBuf {
+    get_root_dir().join("templates").join(name)
+}
+
+pub fn command_exists(command: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {command} >/dev/null 2>&1"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+pub fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+pub fn url_file_name(url: &str) -> Result<String> {
+    url.rsplit('/')
+        .next()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("Could not determine filename from URL: {}", url))
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+pub fn cache_file_name(url: &str) -> Result<String> {
+    let digest = Sha256::digest(url.as_bytes());
+    Ok(format!(
+        "{}-{}",
+        lower_hex(digest.as_ref()),
+        url_file_name(url)?
+    ))
+}
+
+pub fn file_sha256(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+
+    loop {
+        let len = file.read(&mut buffer)?;
+        if len == 0 {
+            break;
+        }
+        hasher.update(&buffer[..len]);
+    }
+
+    let digest = hasher.finalize();
+    Ok(lower_hex(digest.as_ref()))
+}
+
+pub fn load_projects() -> Result<ProjectsMap> {
+    let path = get_config_path();
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read projects.json at {:?}", path))?;
+    serde_json::from_str(&content).context("Failed to parse projects.json")
+}
+
+pub fn load_project(project_key: &str) -> Result<ProjectConfig> {
+    let projects = load_projects()?;
+    let proj_val = projects
+        .get(project_key)
+        .ok_or_else(|| anyhow!("Project not found: {}", project_key))?;
+    serde_json::from_value(proj_val.clone()).context("Failed to parse project config")
+}
+
+pub fn load_anykernel_configs() -> Result<AnyKernelConfigMap> {
+    let path = get_anykernel_config_path();
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read anykernel_configs.json at {:?}", path))?;
+    serde_json::from_str(&content).context("Failed to parse anykernel_configs.json")
+}
+
+pub fn load_anykernel_config(config_key: &str) -> Result<AnyKernelConfig> {
+    let configs = load_anykernel_configs()?;
+    configs
+        .get(config_key)
+        .cloned()
+        .ok_or_else(|| anyhow!("AnyKernel config not found: {}", config_key))
+}
+
+pub fn normalize_variant_name(variant: &str) -> String {
+    variant.replace("sukisuultra", "resukisu")
+}
+
+pub fn variant_suffix(variant: &str) -> String {
+    match normalize_variant_name(variant).as_str() {
+        "main" | "lkm" => "LKM".to_string(),
+        "resukisu" => "ReSuki".to_string(),
+        _ => variant.to_uppercase(),
+    }
+}
+
+pub fn is_resukisu_variant(variant: &str) -> bool {
+    normalize_variant_name(variant) == "resukisu"
+}
+
+pub fn save_json<T: serde::Serialize>(path: &Path, data: &T) -> Result<()> {
+    let content = serde_json::to_string_pretty(data)?;
+    fs::write(path, content + "\n")?;
+    Ok(())
+}
+
+fn write_github_kv(var_name: &str, key: &str, value: &str) -> Result<()> {
+    if let Ok(path) = env::var(var_name) {
+        let mut file = OpenOptions::new().append(true).create(true).open(path)?;
+        writeln!(file, "{}={}", key, value)?;
+    }
+    Ok(())
+}
+
+pub fn set_github_env(key: &str, value: &str) -> Result<()> {
+    write_github_kv("GITHUB_ENV", key, value)
+}
+
+pub fn set_github_output(key: &str, value: &str) -> Result<()> {
+    write_github_kv("GITHUB_OUTPUT", key, value)
+}
+
+pub fn run_cmd(cmd: &[&str], cwd: Option<&Path>, capture: bool) -> Result<Option<String>> {
+    let mut command = Command::new(cmd[0]);
+    command.args(&cmd[1..]);
+
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+
+    if capture {
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "Command failed: {:?} Stderr: {}",
+                cmd,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
+    } else {
+        let status = command.status()?;
+        if !status.success() {
+            return Err(anyhow!("Command failed: {:?}", cmd));
+        }
+        Ok(None)
+    }
+}
+
+pub fn run_cmd_with_env(
+    cmd: &[&str],
+    cwd: Option<&Path>,
+    envs: &HashMap<String, String>,
+) -> Result<()> {
+    let mut command = Command::new(cmd[0]);
+    command.args(&cmd[1..]);
+
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+
+    command.envs(envs);
+
+    command.stdout(Stdio::inherit());
+    command.stderr(Stdio::inherit());
+
+    let status = command.status()?;
+    if !status.success() {
+        return Err(anyhow!("Command failed: {:?}", cmd));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("{name}-{unique}"))
+    }
+
+    #[test]
+    fn cache_file_name_is_stable_and_keeps_filename() {
+        let name = cache_file_name("https://example.com/toolchain.tar.gz").unwrap();
+        assert_eq!(
+            name,
+            "74caec161bcb4f71d8eb363cf7709f7e2132a464e2ef488b473eec8f0ce43249-toolchain.tar.gz"
+        );
+        assert_eq!(
+            name,
+            cache_file_name("https://example.com/toolchain.tar.gz").unwrap()
+        );
+    }
+
+    #[test]
+    fn file_sha256_hashes_file_content() {
+        let path = unique_temp_path("kokuban-sha-test");
+        fs::write(&path, b"abc").unwrap();
+        assert_eq!(
+            file_sha256(&path).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        fs::remove_file(path).unwrap();
+    }
+}
+
+pub fn handle_notify(tag_name: String) -> Result<()> {
+    let token = env::var("TELEGRAM_BOT_TOKEN").context("Missing TELEGRAM_BOT_TOKEN")?;
+    let projects = load_projects()?;
+
+    let globals_val = projects
+        .get("_globals")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let globals: GlobalConfig = serde_json::from_value(globals_val).unwrap_or(GlobalConfig {
+        broadcast_channel: None,
+        resukisu_chat_id: None,
+        resukisu_topic_id: None,
+    });
+
+    let mut target_project: Option<ProjectConfig> = None;
+    let mut repo_url = "Unknown/Repo".to_string();
+
+    for (key, val) in &projects {
+        if key.starts_with("_") {
+            continue;
+        }
+        let p: ProjectConfig = serde_json::from_value(val.clone())?;
+        let prefix = p.zip_name_prefix.as_deref().unwrap_or("Kernel");
+
+        if tag_name.starts_with(prefix) {
+            target_project = Some(p.clone());
+            repo_url = p.repo;
+            break;
+        }
+    }
+
+    if target_project.is_none() {
+        println!("No project found for tag {}", tag_name);
+        return Ok(());
+    }
+
+    let mut destinations = Vec::new();
+    if let Some(chan) = globals.broadcast_channel {
+        destinations.push((chan, None));
+    }
+    if tag_name.contains("ReSuki")
+        && let Some(chat) = globals.resukisu_chat_id
+    {
+        destinations.push((chat, globals.resukisu_topic_id));
+    }
+
+    if destinations.is_empty() {
+        println!("No destinations.");
+        return Ok(());
+    }
+
+    let mut attempt = 0;
+    let max_attempts = 5;
+    let mut release_info_str = String::new();
+
+    while attempt < max_attempts {
+        match run_cmd(
+            &[
+                "gh",
+                "release",
+                "view",
+                &tag_name,
+                "--repo",
+                &repo_url,
+                "--json",
+                "assets,body,name,url,author",
+            ],
+            None,
+            true,
+        ) {
+            Ok(Some(output)) => {
+                release_info_str = output;
+                break;
+            }
+            Ok(None) => break, // Should not happen with capture=true
+            Err(e) => {
+                println!(
+                    "Attempt {}/{} failed to verify release: {}. Retrying in 5s...",
+                    attempt + 1,
+                    max_attempts,
+                    e
+                );
+                attempt += 1;
+                thread::sleep(Duration::from_secs(5));
+            }
+        }
+    }
+
+    if release_info_str.is_empty() {
+        return Err(anyhow!(
+            "Failed to retrieve release info after multiple attempts."
+        ));
+    }
+
+    let release_info: serde_json::Value = serde_json::from_str(&release_info_str)?;
+
+    let author = release_info["author"]["login"]
+        .as_str()
+        .unwrap_or("YuzakiKokuban");
+    let name = release_info["name"].as_str().unwrap_or("Update");
+    let url = release_info["url"].as_str().unwrap_or("");
+
+    let msg = format!(
+        "兄长大人，快看！<code>{}</code> 有新的 Release 了哦。\n\n<b>版本 (Version):</b> <code>{}</code>\n<b>标题 (Title):</b> {}\n<b>作者 (Author):</b> {}\n\n总之，快去看看吧！ <a href='{}'>点击这里跳转</a>",
+        repo_url, tag_name, name, author, url
+    );
+
+    let client = reqwest::blocking::Client::new();
+    let temp_download_dir = env::temp_dir().join(format!(
+        "kokuban_notify_{}_{}",
+        std::process::id(),
+        tag_name.replace(['/', '\\', ' '], "_")
+    ));
+    fs::create_dir_all(&temp_download_dir)?;
+
+    for (chat_id, topic_id) in &destinations {
+        let mut json_body = HashMap::new();
+        json_body.insert("chat_id", serde_json::to_value(chat_id)?);
+        json_body.insert("text", serde_json::to_value(&msg)?);
+        json_body.insert("parse_mode", serde_json::to_value("HTML")?);
+        json_body.insert("disable_web_page_preview", serde_json::to_value(true)?);
+
+        if let Some(tid) = topic_id {
+            json_body.insert("message_thread_id", serde_json::to_value(tid)?);
+        }
+
+        let _ = client
+            .post(format!("https://api.telegram.org/bot{}/sendMessage", token))
+            .json(&json_body)
+            .send();
+    }
+
+    let assets = release_info["assets"].as_array();
+    if let Some(asset_list) = assets {
+        for asset in asset_list {
+            let name = asset["name"].as_str().unwrap();
+            let size = asset["size"].as_i64().unwrap_or(0);
+
+            if size > 50 * 1024 * 1024 {
+                println!("Skipping {} (too large)", name);
+                continue;
+            }
+
+            run_cmd(
+                &[
+                    "gh",
+                    "release",
+                    "download",
+                    &tag_name,
+                    "--repo",
+                    &repo_url,
+                    "-p",
+                    name,
+                    "--clobber",
+                ],
+                Some(&temp_download_dir),
+                false,
+            )?;
+
+            let asset_path = temp_download_dir.join(name);
+
+            for (chat_id, topic_id) in &destinations {
+                let caption = format!(
+                    "兄长大人，附件来了。\n<b>仓库 (Repo):</b> <code>{}</code>\n<b>版本 (Version):</b> <code>{}</code>\n\n📄 <b>文件 (File):</b> <code>{}</code>",
+                    repo_url, tag_name, name
+                );
+
+                let form = reqwest::blocking::multipart::Form::new()
+                    .text("chat_id", chat_id.clone())
+                    .text("caption", caption)
+                    .text("parse_mode", "HTML");
+
+                let form = if let Some(tid) = topic_id {
+                    form.text("message_thread_id", tid.to_string())
+                } else {
+                    form
+                };
+
+                let file_content = fs::read(&asset_path)?;
+                let part = reqwest::blocking::multipart::Part::bytes(file_content)
+                    .file_name(name.to_owned());
+                let form = form.part("document", part);
+
+                let _ = client
+                    .post(format!(
+                        "https://api.telegram.org/bot{}/sendDocument",
+                        token
+                    ))
+                    .multipart(form)
+                    .send();
+            }
+            if asset_path.exists() {
+                fs::remove_file(&asset_path)?;
+            }
+        }
+    }
+
+    if temp_download_dir.exists() {
+        fs::remove_dir_all(temp_download_dir)?;
+    }
+
+    Ok(())
+}

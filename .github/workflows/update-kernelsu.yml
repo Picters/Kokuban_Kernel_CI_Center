@@ -1,0 +1,55 @@
+name: Manual Update KernelSU
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Project to update'
+        required: true
+        type: choice
+        options: [mi17_sm8850]
+      branch:
+        description: 'Variant (KernelSU Type)'
+        required: true
+        type: choice
+        options: [resukisu]
+      commit_id:
+        description: 'Commit Short Hash (Optional, defaults to latest)'
+        required: false
+        default: 'latest'
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download CI Core
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh release download ci-core-latest -p "kokuban_ci_core" --clobber
+          chmod +x kokuban_ci_core
+
+      - name: Determine Commit Hash
+        id: hash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ inputs.commit_id }}" == "latest" ]; then
+            repo="https://github.com/ReSukiSU/ReSukiSU.git"
+            branch="main"
+            echo "COMMIT_ID=$(git ls-remote \"$repo\" \"$branch\" | cut -c1-7)" >> "$GITHUB_ENV"
+          else
+            echo "COMMIT_ID=${{ inputs.commit_id }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Execute Update
+        run: |
+          ./kokuban_ci_core update \
+            --token "${{ secrets.GH_TOKEN }}" \
+            --project "${{ inputs.project }}" \
+            --variant "${{ inputs.branch }}" \
+            --commit-id "${{ env.COMMIT_ID }}"

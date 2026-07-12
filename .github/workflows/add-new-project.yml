@@ -1,0 +1,67 @@
+name: Add New Project
+on:
+  workflow_dispatch:
+    inputs:
+      project_key:
+        description: 'Project Key'
+        required: true
+      repo_path:
+        description: 'GitHub Repo (User/Repo)'
+        required: true
+      defconfig:
+        description: 'Defconfig Name'
+        required: true
+      localversion:
+        description: 'Localversion Base'
+        required: true
+      device_name_cn:
+        description: 'Device Name (CN)'
+        required: true
+        default: '未知设备'
+      device_name_en:
+        description: 'Device Name (EN)'
+        required: true
+        default: 'Unknown Device'
+      ak3_branch:
+        description: 'AnyKernel3 Branch'
+        default: 'master'
+        required: true
+      zip_name:
+        description: 'Zip Name Prefix'
+        default: 'Kernel'
+        required: true
+
+jobs:
+  add-project:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download CI Core
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh release download ci-core-latest -p "kokuban_ci_core" --clobber
+          chmod +x kokuban_ci_core
+
+      - name: Add to Configuration
+        run: |
+          ./kokuban_ci_core add \
+            --key "${{ inputs.project_key }}" \
+            --repo "${{ inputs.repo_path }}" \
+            --defconfig "${{ inputs.defconfig }}" \
+            --localversion "${{ inputs.localversion }}" \
+            --device_cn "${{ inputs.device_name_cn }}" \
+            --device_en "${{ inputs.device_name_en }}" \
+            --ak3_branch "${{ inputs.ak3_branch }}" \
+            --zip_name "${{ inputs.zip_name }}"
+            
+      - name: Commit and Push
+        run: |
+          git config --global user.name "Kokuban-Bot"
+          git config --global user.email "bot@kokuban.dev"
+          git add configs/projects.json
+          git commit -m "feat: add new project ${{ inputs.project_key }}"
+          git push

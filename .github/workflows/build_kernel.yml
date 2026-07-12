@@ -1,0 +1,232 @@
+name: Build Kernel
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Select Project'
+        required: true
+        type: choice
+        options:
+          - mi17_sm8850
+      branch:
+        description: 'Git Branch/Tag'
+        required: true
+        default: 'main'
+      ksu_variant:
+        description: 'Build Mode Override'
+        type: choice
+        options:
+          - default
+          - resukisu
+          - lkm
+        default: 'default'
+      do_release:
+        description: 'Create Release'
+        type: boolean
+        default: true
+      custom_localversion:
+        description: 'Custom Localversion Override'
+        type: string
+        required: false
+        default: ''
+      resukisu_setup_arg:
+        description: 'ReSukiSU setup.sh argument override'
+        type: string
+        required: false
+        default: ''
+      apply_susfs:
+        description: 'Apply SuSFS dynamically during build'
+        type: boolean
+        default: true
+      apply_bbg:
+        description: 'Apply Baseband Guard dynamically during build'
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [build-kernel]
+  workflow_call:
+    inputs:
+      project:
+        required: true
+        type: string
+      branch:
+        required: true
+        type: string
+      ksu_variant:
+        type: string
+        default: 'default'
+      do_release:
+        type: boolean
+        default: true
+      custom_localversion:
+        type: string
+        default: ''
+      resukisu_setup_arg:
+        type: string
+        default: ''
+      apply_susfs:
+        type: boolean
+        default: true
+      apply_bbg:
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      ARTIFACT_DIR: build_artifacts
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve Build Parameters
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            project="${{ github.event.client_payload.project }}"
+            branch="${{ github.event.client_payload.branch }}"
+            variant="default"
+            release="true"
+            custom_localversion=""
+            resukisu_setup_arg=""
+            apply_susfs="${{ github.event.client_payload.apply_susfs }}"
+            apply_bbg="${{ github.event.client_payload.apply_bbg }}"
+            if [ -z "$apply_susfs" ]; then
+              apply_susfs="true"
+            fi
+            if [ -z "$apply_bbg" ]; then
+              apply_bbg="false"
+            fi
+          else
+            project="${{ inputs.project }}"
+            branch="${{ inputs.branch }}"
+            variant="${{ inputs.ksu_variant }}"
+            release="${{ inputs.do_release }}"
+            custom_localversion="${{ inputs.custom_localversion }}"
+            resukisu_setup_arg="${{ inputs.resukisu_setup_arg }}"
+            apply_susfs="${{ inputs.apply_susfs }}"
+            apply_bbg="${{ inputs.apply_bbg }}"
+          fi
+
+          if [ "$variant" = "default" ] || [ -z "$variant" ]; then
+            resolved_variant="$branch"
+          else
+            resolved_variant="$variant"
+          fi
+
+          safe_artifact_branch=$(printf '%s' "$branch" | sed 's#[^A-Za-z0-9._-]#-#g')
+          artifact_name="${project}-kernel-${safe_artifact_branch}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          {
+            echo "PROJECT=$project"
+            echo "BRANCH_TARGET=$branch"
+            echo "VARIANT_INPUT=$variant"
+            echo "VARIANT=$resolved_variant"
+            echo "DO_RELEASE=$release"
+            echo "CUSTOM_LOCALVERSION=$custom_localversion"
+            echo "RESUKISU_SETUP_ARG=$resukisu_setup_arg"
+            echo "APPLY_SUSFS=$apply_susfs"
+            echo "APPLY_BBG=$apply_bbg"
+            echo "ARTIFACT_NAME=$artifact_name"
+          } >> "$GITHUB_ENV"
+
+      - name: Download CI Core
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh release download ci-core-latest -p "kokuban_ci_core"
+          chmod +x kokuban_ci_core
+
+      - name: Parse Configuration
+        run: ./kokuban_ci_core parse --project ${{ env.PROJECT }}
+
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.PROJECT_REPO }}
+          ref: ${{ env.BRANCH_TARGET }}
+          path: kernel_source
+          submodules: recursive
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Setup sccache
+        uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          variant: sccache
+          key: kernel-build-shared-${{ env.PROJECT }}
+          max-size: 5G
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git libncurses5-dev bc bison flex libssl-dev p7zip-full lz4 cpio curl libelf-dev dwarves jq lld pahole libdw-dev
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Ensure compat cross-linker
+        run: |
+          # Older kernels (e.g. 5.4) use $(CROSS_COMPILE_COMPAT)ld for vdso32 linking.
+          # Ensure arm-linux-gnueabi-ld resolves to ld.lld (supports ARM32).
+          mkdir -p "$HOME/.local/bin"
+          for name in arm-linux-gnueabi-ld arm-linux-gnueabi-ld.bfd; do
+            if ! command -v "$name" &>/dev/null; then
+              ln -sf "$(command -v ld.lld)" "$HOME/.local/bin/$name"
+              echo "Created $HOME/.local/bin/$name -> $(command -v ld.lld)"
+            fi
+          done
+
+      - name: Build and Release
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          ARGS=(--project ${{ env.PROJECT }} --branch ${{ env.VARIANT }} --do-release ${{ env.DO_RELEASE }})
+          if [ -n "${{ env.CUSTOM_LOCALVERSION }}" ]; then
+            ARGS+=("--custom-localversion=${{ env.CUSTOM_LOCALVERSION }}")
+          fi
+          if [ -n "${{ env.RESUKISU_SETUP_ARG }}" ]; then
+            ARGS+=("--resukisu-setup-arg=${{ env.RESUKISU_SETUP_ARG }}")
+          fi
+          ARGS+=("--apply-susfs" "${{ env.APPLY_SUSFS }}")
+          ARGS+=("--apply-bbg" "${{ env.APPLY_BBG }}")
+          ./kokuban_ci_core build "${ARGS[@]}"
+
+      - name: Collect Build Artifacts
+        if: always()
+        id: collect-artifacts
+        run: |
+          if ./kokuban_ci_core collect-artifacts --artifact-dir "$ARTIFACT_DIR"; then
+            :
+          else
+            echo "collect-artifacts command unavailable, falling back to shell collector."
+            mkdir -p "$ARTIFACT_DIR"
+            shopt -s nullglob
+
+            copied=0
+            for zipball in *.zip; do
+              cp "$zipball" "$ARTIFACT_DIR/"
+              copied=1
+            done
+
+            for extra_file in kernel_source/out/.config kernel_source/out/vmlinux.symvers; do
+              if [ -f "$extra_file" ]; then
+                cp "$extra_file" "$ARTIFACT_DIR/"
+                copied=1
+              fi
+            done
+
+            if [ "$copied" -eq 1 ]; then
+              echo "has_artifacts=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_artifacts=false" >> "$GITHUB_OUTPUT"
+              echo "No build artifacts were produced, skipping upload."
+            fi
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        if: always() && steps.collect-artifacts.outputs.has_artifacts == 'true'
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_DIR }}
+          include-hidden-files: true

@@ -1,0 +1,63 @@
+name: Watch Upstream KernelSU
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.watcher.outputs.matrix }}
+      found_updates: ${{ steps.watcher.outputs.found_updates }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download CI Core
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh release download ci-core-latest -p "kokuban_ci_core" --clobber
+          chmod +x kokuban_ci_core
+          
+      - name: Check Upstream
+        id: watcher
+        run: ./kokuban_ci_core watch
+        
+      - name: Commit Updated Tracker
+        if: steps.watcher.outputs.found_updates == 'true'
+        run: |
+          git config --global user.name "Kokuban-Watcher"
+          git config --global user.email "watcher@kokuban.dev"
+          git add configs/upstream_commits.json
+          git commit -m "ci: update upstream records"
+          git push
+
+  update-projects:
+    needs: check
+    if: needs.check.outputs.found_updates == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.check.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download CI Core
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh release download ci-core-latest -p "kokuban_ci_core" --clobber
+          chmod +x kokuban_ci_core
+          
+      - name: Perform Update
+        run: |
+          ./kokuban_ci_core update \
+            --token "${{ secrets.GH_TOKEN }}" \
+            --project "${{ matrix.project }}" \
+            --variant "${{ matrix.variant }}" \
+            --commit-id "${{ matrix.commit_id }}"

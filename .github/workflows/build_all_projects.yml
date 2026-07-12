@@ -1,0 +1,45 @@
+name: Build All Projects
+on:
+  workflow_dispatch:
+    inputs:
+      do_release:
+        description: 'Create GitHub Releases for every build'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download CI Core
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh release download ci-core-latest -p "kokuban_ci_core" --clobber
+          chmod +x kokuban_ci_core
+
+      - name: Generate Matrix
+        id: set-matrix
+        run: ./kokuban_ci_core matrix-all
+
+  build:
+    needs: matrix
+    strategy:
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+      fail-fast: false
+    uses: ./.github/workflows/build_kernel.yml
+    with:
+      project: ${{ matrix.project }}
+      branch: ${{ matrix.branch }}
+      ksu_variant: ${{ matrix.ksu_variant }}
+      do_release: ${{ inputs.do_release }}
+      apply_susfs: true
+      apply_bbg: false
+    secrets: inherit
