@@ -1291,8 +1291,21 @@ fn collect_c_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 /// expected type 0xc4815b0f, Comm: reaver). Rewrite the return type to
 /// `netdev_tx_t` at both the definition and the `extern` decls; the `return 0;`
 /// / `return ret;` bodies stay valid (NETDEV_TX_OK == 0).
+///
+/// The SAME return-type bug is independently hardcoded (no `#if
+/// LINUX_VERSION_CODE` guard, unlike e.g. `add_virtual_intf`) in TWO more
+/// netdev TX entry points that each drive their own separate `net_device_ops`
+/// table, so fixing `rtw_xmit_entry` alone leaves both unpatched:
+/// - `rtw_cfg80211_monitor_if_xmit_entry` — the TX entry of the *cfg80211
+///   virtual monitor-mode netdev* (`rtw_cfg80211_monitor_if_ops`), i.e.
+///   exactly the `wlan0mon`-style interface airmon-ng/wifite create via `iw
+///   set type monitor` and that aircrack-ng-suite tools inject through.
+/// - `mgnt_xmit_entry` — the TX entry of the separate "hostapd mgnt" netdev
+///   (`rtl871x_mgnt_netdev_ops`) used for raw management-frame injection.
+/// Both are `static`, so unlike `rtw_xmit_entry` there is no header `extern`
+/// copy to patch — the definition line is the only occurrence.
 fn patch_realtek_cfi(subdir: &Path) {
-    let rules: [(&str, &str, &str); 4] = [
+    let rules: [(&str, &str, &str); 6] = [
         (
             "usb_recv_tasklet(void *priv)",
             "usb_recv_tasklet(unsigned long priv)",
@@ -1313,12 +1326,22 @@ fn patch_realtek_cfi(subdir: &Path) {
             "netdev_tx_t rtw_xmit_entry(_pkt *pkt, _nic_hdl pnetdev)",
             "ndo-start-xmit",
         ),
+        (
+            "int rtw_cfg80211_monitor_if_xmit_entry(struct sk_buff *skb, struct net_device *ndev)",
+            "netdev_tx_t rtw_cfg80211_monitor_if_xmit_entry(struct sk_buff *skb, struct net_device *ndev)",
+            "monitor-if-xmit",
+        ),
+        (
+            "int mgnt_xmit_entry(struct sk_buff *skb, struct net_device *pnetdev)",
+            "netdev_tx_t mgnt_xmit_entry(struct sk_buff *skb, struct net_device *pnetdev)",
+            "mgnt-xmit",
+        ),
     ];
 
     let mut files = Vec::new();
     collect_c_sources(subdir, &mut files);
 
-    let mut hits = [0usize; 4];
+    let mut hits = [0usize; 6];
     for file in files {
         let Ok(content) = fs::read_to_string(&file) else {
             continue;
