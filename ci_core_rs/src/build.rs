@@ -1276,8 +1276,23 @@ fn collect_c_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 /// so the compiled callbacks are already `void(struct urb *)` and CFI-safe.
 /// Editing their definitions turns the 2-arg macro invocation into a 1-arg one
 /// ("too few arguments provided to function-like macro invocation").
+///
+/// A SECOND, distinct CFI trap lives on the netdev TX path. The drivers declare
+/// `int rtw_xmit_entry(_pkt *pkt, _nic_hdl pnetdev)` and assign it straight to
+/// `net_device_ops.ndo_start_xmit`, which the kernel calls as
+/// `netdev_tx_t(*)(struct sk_buff *, struct net_device *)`. The args match after
+/// typedef, but the *return type* differs (`int` vs the `netdev_tx_t` enum), so
+/// the CFI type-id differs and `dev_hard_start_xmit`'s indirect call hard-panics
+/// ("CFI failure at dev_hard_start_xmit ... target: rtw_xmit_entry ...") the
+/// first time a frame is actually transmitted through the netdev. This does NOT
+/// fire on `iface up` or monitor scanning (no ndo TX), only once a tool pushes a
+/// real frame — e.g. reaver/pixiedust's WPS EAPOL exchange via AF_PACKET
+/// sendto(). Diagnosed on-device via last_kmsg (target rtw_xmit_entry [88x2bu],
+/// expected type 0xc4815b0f, Comm: reaver). Rewrite the return type to
+/// `netdev_tx_t` at both the definition and the `extern` decls; the `return 0;`
+/// / `return ret;` bodies stay valid (NETDEV_TX_OK == 0).
 fn patch_realtek_cfi(subdir: &Path) {
-    let rules: [(&str, &str, &str); 3] = [
+    let rules: [(&str, &str, &str); 4] = [
         (
             "usb_recv_tasklet(void *priv)",
             "usb_recv_tasklet(unsigned long priv)",
@@ -1293,12 +1308,17 @@ fn patch_realtek_cfi(subdir: &Path) {
             "mpath_tx_tasklet_hdl(unsigned long priv)",
             "mesh-tasklet",
         ),
+        (
+            "int rtw_xmit_entry(_pkt *pkt, _nic_hdl pnetdev)",
+            "netdev_tx_t rtw_xmit_entry(_pkt *pkt, _nic_hdl pnetdev)",
+            "ndo-start-xmit",
+        ),
     ];
 
     let mut files = Vec::new();
     collect_c_sources(subdir, &mut files);
 
-    let mut hits = [0usize; 3];
+    let mut hits = [0usize; 4];
     for file in files {
         let Ok(content) = fs::read_to_string(&file) else {
             continue;
