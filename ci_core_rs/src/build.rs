@@ -1256,28 +1256,28 @@ fn collect_c_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Realtek OOT USB Wi-Fi drivers (aircrack-ng / morrownr forks) register their
-/// tasklet and URB-completion callbacks through function-pointer casts that hide
-/// a prototype mismatch: the callbacks are declared with the legacy
-/// `(void *priv)` / `(struct urb *, struct pt_regs *)` signatures, but the kernel
-/// invokes them as `void(unsigned long)` (tasklet `->func`) and
-/// `void(struct urb *)` (`usb_complete_t`). On GKI kernels built with
-/// CONFIG_CFI_CLANG the indirect call in `tasklet_action_common` / the USB core
-/// validates the callback's *real* prototype and hard-panics
-/// ("CFI: Fatal exception in interrupt") on the mismatch — an instant reboot the
-/// moment the adapter's netdev is brought up (TX schedules the xmit tasklet, RX
-/// completes a URB). Rewrite the prototypes to the exact types the kernel calls
-/// them with; the casts at the registration sites then become harmless no-ops.
-/// Whole-tree, literal, idempotent — a no-op on already-patched or non-Realtek
-/// sources. Diagnosed on-device via last_kmsg CFI trace (rtl8822bu_xmit_tasklet).
+/// tasklet callbacks through function-pointer casts that hide a prototype
+/// mismatch: the callbacks are declared `(void *priv)` but the kernel invokes
+/// them as `void(unsigned long)` (tasklet `->func`). On GKI kernels built with
+/// CONFIG_CFI_CLANG the indirect call in `tasklet_action_common` validates the
+/// callback's *real* prototype and hard-panics ("CFI: Fatal exception in
+/// interrupt") on the mismatch — an instant reboot the moment the adapter's
+/// netdev is brought up (TX schedules the xmit tasklet, RX the recv tasklet).
+/// Rewrite the prototypes to the exact type the kernel calls them with; the cast
+/// at the registration site then becomes a harmless no-op. Whole-tree, literal,
+/// idempotent — a no-op on already-patched or non-Realtek sources. Diagnosed
+/// on-device via last_kmsg CFI trace (rtl8822bu_xmit_tasklet, type 0xb990318e).
+///
+/// NOTE: the URB-completion callbacks (`usb_*_complete`,
+/// `_usbctrl_vendorreq_async_callback`) look similarly mis-typed (they carry a
+/// vestigial `struct pt_regs *regs` arg) but MUST NOT be touched: the drivers
+/// already strip it via function-like compat macros in `usb_ops_linux.h`
+/// (`#define usb_write_port_complete(purb, regs) usb_write_port_complete(purb)`),
+/// so the compiled callbacks are already `void(struct urb *)` and CFI-safe.
+/// Editing their definitions turns the 2-arg macro invocation into a 1-arg one
+/// ("too few arguments provided to function-like macro invocation").
 fn patch_realtek_cfi(subdir: &Path) {
-    let rules: [(&str, &str, &str); 4] = [
-        // Every URB-completion callback (`usb_*_complete`,
-        // `_usbctrl_vendorreq_async_callback`, ...) carries a vestigial 2.6-era
-        // `struct pt_regs *regs` second arg the modern `usb_complete_t`
-        // (`void(struct urb *)`) does not have. `pt_regs` appears nowhere else in
-        // these drivers, so dropping the arg wholesale fixes them all regardless
-        // of the first param's name (`purb` vs `urb`); no body uses `regs`.
-        (", struct pt_regs *regs", "", "urb-complete pt_regs"),
+    let rules: [(&str, &str, &str); 3] = [
         (
             "usb_recv_tasklet(void *priv)",
             "usb_recv_tasklet(unsigned long priv)",
@@ -1298,7 +1298,7 @@ fn patch_realtek_cfi(subdir: &Path) {
     let mut files = Vec::new();
     collect_c_sources(subdir, &mut files);
 
-    let mut hits = [0usize; 4];
+    let mut hits = [0usize; 3];
     for file in files {
         let Ok(content) = fs::read_to_string(&file) else {
             continue;
