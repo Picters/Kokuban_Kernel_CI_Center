@@ -1237,6 +1237,95 @@ fn dump_kmi_baseline(kernel_source_path: &Path) {
     println!("KMI-CHECK: module_layout symbol not found in symvers; cannot verify KMI.");
 }
 
+/// Recursively collect *.c / *.h files under `dir`.
+fn collect_c_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_c_sources(&path, out);
+        } else if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("c") | Some("h")
+        ) {
+            out.push(path);
+        }
+    }
+}
+
+/// Realtek OOT USB Wi-Fi drivers (aircrack-ng / morrownr forks) register their
+/// tasklet and URB-completion callbacks through function-pointer casts that hide
+/// a prototype mismatch: the callbacks are declared with the legacy
+/// `(void *priv)` / `(struct urb *, struct pt_regs *)` signatures, but the kernel
+/// invokes them as `void(unsigned long)` (tasklet `->func`) and
+/// `void(struct urb *)` (`usb_complete_t`). On GKI kernels built with
+/// CONFIG_CFI_CLANG the indirect call in `tasklet_action_common` / the USB core
+/// validates the callback's *real* prototype and hard-panics
+/// ("CFI: Fatal exception in interrupt") on the mismatch — an instant reboot the
+/// moment the adapter's netdev is brought up (TX schedules the xmit tasklet, RX
+/// completes a URB). Rewrite the prototypes to the exact types the kernel calls
+/// them with; the casts at the registration sites then become harmless no-ops.
+/// Whole-tree, literal, idempotent — a no-op on already-patched or non-Realtek
+/// sources. Diagnosed on-device via last_kmsg CFI trace (rtl8822bu_xmit_tasklet).
+fn patch_realtek_cfi(subdir: &Path) {
+    let rules: [(&str, &str, &str); 4] = [
+        // Every URB-completion callback (`usb_*_complete`,
+        // `_usbctrl_vendorreq_async_callback`, ...) carries a vestigial 2.6-era
+        // `struct pt_regs *regs` second arg the modern `usb_complete_t`
+        // (`void(struct urb *)`) does not have. `pt_regs` appears nowhere else in
+        // these drivers, so dropping the arg wholesale fixes them all regardless
+        // of the first param's name (`purb` vs `urb`); no body uses `regs`.
+        (", struct pt_regs *regs", "", "urb-complete pt_regs"),
+        (
+            "usb_recv_tasklet(void *priv)",
+            "usb_recv_tasklet(unsigned long priv)",
+            "recv-tasklet",
+        ),
+        (
+            "_xmit_tasklet(void *priv)",
+            "_xmit_tasklet(unsigned long priv)",
+            "xmit-tasklet",
+        ),
+        (
+            "mpath_tx_tasklet_hdl(void *priv)",
+            "mpath_tx_tasklet_hdl(unsigned long priv)",
+            "mesh-tasklet",
+        ),
+    ];
+
+    let mut files = Vec::new();
+    collect_c_sources(subdir, &mut files);
+
+    let mut hits = [0usize; 4];
+    for file in files {
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let mut patched = content.clone();
+        for (i, &(needle, repl, _)) in rules.iter().enumerate() {
+            let n = patched.matches(needle).count();
+            if n > 0 {
+                hits[i] += n;
+                patched = patched.replace(needle, repl);
+            }
+        }
+        if patched != content {
+            let _ = fs::write(&file, patched);
+        }
+    }
+
+    for (i, &(_, _, label)) in rules.iter().enumerate() {
+        if hits[i] > 0 {
+            println!("NetHunter OOT CFI patch: {} x{}", label, hits[i]);
+        }
+    }
+    if hits.iter().all(|&n| n == 0) {
+        println!("NetHunter OOT CFI patch: no patterns matched (already patched / non-Realtek)");
+    }
+}
+
 /// Clone + build the out-of-tree aircrack Wi-Fi injection drivers
 /// (rtl8812au/8814au/8188eus for RTL8812AU/8814AU chips absent from in-tree
 /// 6.12) against the just-built kernel and drop their .ko into the AnyKernel3
@@ -1301,6 +1390,12 @@ fn build_nethunter_oot_modules(
         if let Ok(content) = fs::read_to_string(&makefile) {
             let _ = fs::write(&makefile, content.replace("-Werror", ""));
         }
+
+        // Rewrite the driver's tasklet / URB-completion callback prototypes so
+        // they match the types the kernel calls them with; otherwise the GKI
+        // CONFIG_CFI_CLANG check hard-panics ("CFI: Fatal exception in
+        // interrupt") the instant the adapter's interface is brought up.
+        patch_realtek_cfi(&subdir_abs);
 
         let m_arg = format!("M={}", subdir_abs.display());
         let mut args: Vec<&str> = make_args.to_vec();
