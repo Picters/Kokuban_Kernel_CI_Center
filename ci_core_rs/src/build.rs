@@ -1369,6 +1369,67 @@ fn patch_realtek_cfi(subdir: &Path) {
     }
 }
 
+/// The aircrack-ng forks (rtl8812au -> 88XXau.ko, rtl8188eus -> 8188eu.ko)
+/// declare their variable-length 802.11 IE struct with a fixed 1-byte
+/// trailing member (`UCHAR data[1]`) instead of a C99 flexible array member,
+/// then read past it unconditionally — e.g. `check_assoc_AP()` in
+/// rtw_wlan_util.c does `_rtw_memcmp(pIE->data, <OUI>, 3)` (and even
+/// `pIE->data[4]`/`[5]` for the Realtek vendor IE branch) against a
+/// statically 1-byte array. On a GKI kernel built with UBSAN's array-bounds
+/// sanitizer this is a compile-time-provable violation, not a runtime
+/// buffer overrun, so it hard-panics
+/// ("UBSAN: array index out of bounds ... Fatal exception in interrupt")
+/// the moment the driver actually parses a real (assoc-response/beacon) IE
+/// list from the air — i.e. on a normal 802.11 association, which
+/// wpa_supplicant-driven tools (OneShot) trigger via cfg80211_connect but
+/// raw-WPS-only tools (reaver/bully) mostly don't. Diagnosed on-device via
+/// last_kmsg: `check_assoc_AP+0x1c8/0x1d0 [88XXau]`, Comm: wpa_supplicant,
+/// called from rtw_joinbss_cmd -> ... -> cfg80211_connect -> nl80211_connect.
+/// Fix: widen `data[1]` to `data[]` in `include/wlan_bssdef.h`
+/// (NDIS_802_11_VARIABLE_IEs). Purely a type-level annotation change — the
+/// struct is never used with fixed-size `sizeof()`, so this doesn't move
+/// any real memory layout, it just removes the false static-bounds
+/// violation while the driver's own `i < len` loop bound keeps doing the
+/// actual (runtime) bounds checking it always relied on. The morrownr forks
+/// (8814au, 88x2bu) already use `u8 data[]` upstream and are unaffected.
+fn patch_realtek_ubsan(subdir: &Path) {
+    let rules: [(&str, &str, &str); 1] = [(
+        "UCHAR  data[1];",
+        "UCHAR  data[];",
+        "var-ie-flexarray",
+    )];
+
+    let mut files = Vec::new();
+    collect_c_sources(subdir, &mut files);
+
+    let mut hits = [0usize; 1];
+    for file in files {
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let mut patched = content.clone();
+        for (i, &(needle, repl, _)) in rules.iter().enumerate() {
+            let n = patched.matches(needle).count();
+            if n > 0 {
+                hits[i] += n;
+                patched = patched.replace(needle, repl);
+            }
+        }
+        if patched != content {
+            let _ = fs::write(&file, patched);
+        }
+    }
+
+    for (i, &(_, _, label)) in rules.iter().enumerate() {
+        if hits[i] > 0 {
+            println!("NetHunter OOT UBSAN patch: {} x{}", label, hits[i]);
+        }
+    }
+    if hits.iter().all(|&n| n == 0) {
+        println!("NetHunter OOT UBSAN patch: no patterns matched (already patched / non-aircrack)");
+    }
+}
+
 /// Clone + build the out-of-tree aircrack Wi-Fi injection drivers
 /// (rtl8812au/8814au/8188eus for RTL8812AU/8814AU chips absent from in-tree
 /// 6.12) against the just-built kernel and drop their .ko into the AnyKernel3
@@ -1439,6 +1500,13 @@ fn build_nethunter_oot_modules(
         // CONFIG_CFI_CLANG check hard-panics ("CFI: Fatal exception in
         // interrupt") the instant the adapter's interface is brought up.
         patch_realtek_cfi(&subdir_abs);
+
+        // Widen the fixed data[1] variable-IE trailing array to a flexible
+        // array member; otherwise UBSAN's array-bounds check hard-panics the
+        // moment check_assoc_AP() parses a real assoc-response IE list
+        // during a normal 802.11 association (e.g. wpa_supplicant-driven
+        // tools like OneShot).
+        patch_realtek_ubsan(&subdir_abs);
 
         let m_arg = format!("M={}", subdir_abs.display());
         let mut args: Vec<&str> = make_args.to_vec();
