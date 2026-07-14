@@ -34,6 +34,21 @@ Dispatch **Build Kernel** from the Actions tab with `project=mi17_sm8850` and
 and wait for it to finish — the kernel build downloads that prebuilt core, so triggering
 both back-to-back would race the rebuild.
 
+## Known issues
+
+The Wi-Fi injection drivers (aircrack-ng `rtl8812au`/`rtl8188eus`, morrownr `8814au`/`88x2bu`)
+are old vendor codebases never written against a CFI- and UBSAN-hardened GKI kernel. We've
+already found and patched several classes of runtime-only bugs this exposes (mismatched
+callback prototypes under `CONFIG_CFI_CLANG`, fixed-size arrays that trip UBSAN's
+array-bounds sanitizer — see `patch_realtek_cfi()` / `patch_realtek_ubsan()` in
+[`ci_core_rs/src/build.rs`](ci_core_rs/src/build.rs)), but more may exist in code paths we
+haven't exercised yet.
+
+**If an adapter crashes or hard-reboots the device, please open an issue** on this repo with
+whatever you were doing at the time and, if possible, the panic trace from
+`/data/vendor/diag/last_kmsg` (survives the reboot; `su -c 'cat /data/vendor/diag/last_kmsg'`).
+That trace is normally enough to pin down the exact function and fix it.
+
 ## Credits
 
 Base CI & kernel: **Kokuban / YuzakiKokuban** · Root: **ReSukiSU / KernelSU** · SuSFS:

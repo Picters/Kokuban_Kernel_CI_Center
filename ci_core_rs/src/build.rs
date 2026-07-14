@@ -1369,40 +1369,69 @@ fn patch_realtek_cfi(subdir: &Path) {
     }
 }
 
-/// The aircrack-ng forks (rtl8812au -> 88XXau.ko, rtl8188eus -> 8188eu.ko)
-/// declare their variable-length 802.11 IE struct with a fixed 1-byte
-/// trailing member (`UCHAR data[1]`) instead of a C99 flexible array member,
-/// then read past it unconditionally — e.g. `check_assoc_AP()` in
-/// rtw_wlan_util.c does `_rtw_memcmp(pIE->data, <OUI>, 3)` (and even
-/// `pIE->data[4]`/`[5]` for the Realtek vendor IE branch) against a
-/// statically 1-byte array. On a GKI kernel built with UBSAN's array-bounds
-/// sanitizer this is a compile-time-provable violation, not a runtime
+/// Several Realtek OOT structs declare a variable-length trailing field with
+/// a fixed 1-byte array (`UCHAR data[1]` / `u8 Data[1]` / `u1Byte buf[1]`)
+/// instead of a C99 flexible array member, then read/write past it
+/// unconditionally. On a GKI kernel built with UBSAN's array-bounds
+/// sanitizer that is a compile-time-provable violation, not a runtime
 /// buffer overrun, so it hard-panics
 /// ("UBSAN: array index out of bounds ... Fatal exception in interrupt")
-/// the moment the driver actually parses a real (assoc-response/beacon) IE
-/// list from the air — i.e. on a normal 802.11 association, which
-/// wpa_supplicant-driven tools (OneShot) trigger via cfg80211_connect but
-/// raw-WPS-only tools (reaver/bully) mostly don't. Diagnosed on-device via
-/// last_kmsg: `check_assoc_AP+0x1c8/0x1d0 [88XXau]`, Comm: wpa_supplicant,
-/// called from rtw_joinbss_cmd -> ... -> cfg80211_connect -> nl80211_connect.
-/// Fix: widen `data[1]` to `data[]` in `include/wlan_bssdef.h`
-/// (NDIS_802_11_VARIABLE_IEs). Purely a type-level annotation change — the
-/// struct is never used with fixed-size `sizeof()`, so this doesn't move
-/// any real memory layout, it just removes the false static-bounds
-/// violation while the driver's own `i < len` loop bound keeps doing the
-/// actual (runtime) bounds checking it always relied on. The morrownr forks
-/// (8814au, 88x2bu) already use `u8 data[]` upstream and are unaffected.
+/// the moment the driver actually touches the byte(s) past index 0.
+/// Diagnosed on-device: `check_assoc_AP+0x1c8/0x1d0 [88XXau]`, Comm:
+/// wpa_supplicant, via rtw_joinbss_cmd -> ... -> cfg80211_connect ->
+/// nl80211_connect — i.e. on a normal 802.11 association, which
+/// wpa_supplicant-driven tools (OneShot) trigger but raw-WPS-only tools
+/// (reaver/bully) mostly don't, which is why this surfaced late.
+/// `check_assoc_AP()` in rtw_wlan_util.c does `_rtw_memcmp(pIE->data,
+/// <OUI>, 3)` (and even `pIE->data[4]`/`[5]` for the Realtek vendor IE
+/// branch) against `NDIS_802_11_VARIABLE_IEs.data`, a statically 1-byte
+/// array in the two aircrack-ng forks (rtl8812au -> 88XXau.ko, rtl8188eus
+/// -> 8188eu.ko); the morrownr forks (8814au, 88x2bu) already use `u8
+/// data[]` upstream there. Auditing every other fixed-`[1]`
+/// variable-length-looking field across all 4 forks turned up two more,
+/// present in ALL FOUR forks including the two morrownr ones:
+/// `rtw_HCI_event.Data[1]` (include/rtw_btcoex.h, BT-coex HCI event
+/// buffer) and, 88x2bu-only, `COL_H2C.buf[1]` / `COL_C2H_ACK.buf[1]` /
+/// `COL_C2H_IND.data[1]` (hal/btc/halbtcoutsrc.h, BT-coex "offload"
+/// structs) — all written past index 0 the same way
+/// (`pEvent->Data[1]`/`[2]`/`[len]` in rtw_btcoex.c). These are BT-coex
+/// paths that are normally inert on a WiFi-only USB dongle with no BT
+/// radio, but they're the exact same class of static-bounds UB, so widen
+/// them proactively rather than wait for another crash report. Fix: widen
+/// every `[1]` to `[]` (flexible array member) at OOT clone time. Purely a
+/// type-level annotation change — none of these structs are used with a
+/// fixed-size `sizeof()` of the trailing field, so this doesn't move any
+/// real memory layout; whatever length-tracking the driver's own code
+/// already does (loop bound, `len` param, `ret_len` field) remains the
+/// actual (runtime) bounds check it always relied on.
 fn patch_realtek_ubsan(subdir: &Path) {
-    let rules: [(&str, &str, &str); 1] = [(
-        "UCHAR  data[1];",
-        "UCHAR  data[];",
-        "var-ie-flexarray",
-    )];
+    let rules: [(&str, &str, &str); 4] = [
+        (
+            "UCHAR  data[1];",
+            "UCHAR  data[];",
+            "var-ie-flexarray",
+        ),
+        (
+            "u8\t\tData[1]; /* byte1 is extension event code */",
+            "u8\t\tData[]; /* byte1 is extension event code */",
+            "hci-event-data-flexarray",
+        ),
+        (
+            "u1Byte\tbuf[1];",
+            "u1Byte\tbuf[];",
+            "col-h2c-buf-flexarray",
+        ),
+        (
+            "u1Byte\tdata[1];",
+            "u1Byte\tdata[];",
+            "col-c2h-ind-data-flexarray",
+        ),
+    ];
 
     let mut files = Vec::new();
     collect_c_sources(subdir, &mut files);
 
-    let mut hits = [0usize; 1];
+    let mut hits = [0usize; 4];
     for file in files {
         let Ok(content) = fs::read_to_string(&file) else {
             continue;
@@ -1426,7 +1455,7 @@ fn patch_realtek_ubsan(subdir: &Path) {
         }
     }
     if hits.iter().all(|&n| n == 0) {
-        println!("NetHunter OOT UBSAN patch: no patterns matched (already patched / non-aircrack)");
+        println!("NetHunter OOT UBSAN patch: no patterns matched (already patched / non-Realtek)");
     }
 }
 
