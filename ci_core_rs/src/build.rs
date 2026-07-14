@@ -1157,15 +1157,66 @@ fn build_oot_module_zip(module_zip_name: &str, version_str: &str) -> Result<bool
         }
     }
 
+    // Stage the Picters Modules Manager APK as a genuine system app via the same
+    // systemless overlay, if one has been built. It's a separate Flutter project
+    // (github.com/Picters/picters_modules_manager, not part of this crate/repo) that
+    // releases its own APK as a GitHub release asset — deliberately NOT built from
+    // source here, so a Flutter/Gradle toolchain issue can never break a kernel build,
+    // and the app's release cadence stays independent of the kernel's. If no APK has
+    // already been placed at <cwd>/PictersModulesManager.apk (e.g. by hand, for a local
+    // test build), best-effort fetch the latest release; either way this never fails
+    // the kernel build, it just skips embedding the app if nothing is available.
+    // PackageManager only scans /system/app at boot, so this needs a reboot after
+    // (re)installing the module before the app is registered/updated — a live
+    // `pm install` would only add it as a normal user app, not register it as system.
+    let apk_src = cwd.join("PictersModulesManager.apk");
+    if !apk_src.exists() {
+        let _ = run_cmd(
+            &[
+                "gh",
+                "release",
+                "download",
+                "--repo",
+                "Picters/picters_modules_manager",
+                "--pattern",
+                "*.apk",
+                "--output",
+                apk_src.to_str().unwrap_or("PictersModulesManager.apk"),
+                "--clobber",
+            ],
+            None,
+            false,
+        );
+    }
+    let apk_embedded = if apk_src.exists() {
+        let app_dir = stage.join("system/app/PictersModulesManager");
+        fs::create_dir_all(&app_dir)?;
+        fs::copy(&apk_src, app_dir.join("PictersModulesManager.apk"))?;
+        true
+    } else {
+        println!(
+            "NetHunter: no PictersModulesManager.apk at {:?}, module zip will not carry the manager app",
+            apk_src
+        );
+        false
+    };
+
     fs::write(
         stage.join("module.prop"),
         format!(
-            "id=nethunter-oot-modules\nname=NetHunter OOT Kernel Modules\nversion={version_str}\nversionCode=1\nauthor=Picters\ndescription=Out-of-tree kernel modules (Wi-Fi injection adapters, BT, CAN, SDR/DVB, NTFS) for the matching NetHunter kernel. Install via any KernelSU-family or Magisk manager.\n"
+            "id=nethunter-oot-modules\nname=Picters Modules Manager\nversion={version_str}\nversionCode=1\nauthor=Picters\ndescription=Out-of-tree kernel modules (Wi-Fi injection adapters, BT, CAN, SDR/DVB, NTFS) for the matching NetHunter kernel. All modules stay unloaded until toggled from the Picters Modules Manager app — open it via this module's Action button.\n"
         ),
     )?;
+    let apk_ui_line = if apk_embedded {
+        "ui_print \"- Picters Modules Manager staged as a system app — reboot to activate\"\n"
+    } else {
+        ""
+    };
     fs::write(
         stage.join("customize.sh"),
-        "#!/sbin/sh\nSKIPUNZIP=0\nui_print \"- Picters NetHunter OOT modules\"\nKO=$(ls \"$MODPATH/system/lib/modules/\"*.ko 2>/dev/null | wc -l)\nui_print \"- $KO drivers staged\"\nset_perm_recursive \"$MODPATH\" 0 0 0755 0644\nfor s in service.sh inject.sh action.sh nh-modules.sh; do [ -f \"$MODPATH/$s\" ] && chmod 0755 \"$MODPATH/$s\"; done\nui_print \"- Non-Wi-Fi drivers auto-load at boot\"\nui_print \"- Wi-Fi injection: module Action / Picters Manager WebUI\"\n",
+        format!(
+            "#!/sbin/sh\nSKIPUNZIP=0\nui_print \"- Picters NetHunter OOT modules\"\nKO=$(ls \"$MODPATH/system/lib/modules/\"*.ko 2>/dev/null | wc -l)\nui_print \"- $KO drivers staged (unloaded by default)\"\nset_perm_recursive \"$MODPATH\" 0 0 0755 0644\n[ -f \"$MODPATH/action.sh\" ] && chmod 0755 \"$MODPATH/action.sh\"\n{apk_ui_line}ui_print \"- Use the module Action button to open Picters Modules Manager\"\n"
+        ),
     )?;
     fs::write(
         stage.join("META-INF/com/google/android/updater-script"),
@@ -1176,18 +1227,11 @@ fn build_oot_module_zip(module_zip_name: &str, version_str: &str) -> Result<bool
         "#!/sbin/sh\numask 022\nOUTFD=$2\nZIPFILE=$3\nmount /data 2>/dev/null\nui_print() { echo \"$1\"; }\nif [ -f /data/adb/magisk/util_functions.sh ]; then\n  . /data/adb/magisk/util_functions.sh\n  install_module\n  exit 0\nfi\nui_print \"*** Install this zip from your KernelSU/Magisk manager (Modules > Install from storage) ***\"\nexit 1\n",
     )?;
 
-    // Picters Manager WebUI (KernelSU/SukiSU/ReSukiSU `webroot`) — one-tap cfg80211
-    // vendor<->kernel toggle — plus a shell Action fallback for managers without WebUI.
-    fs::create_dir_all(stage.join("webroot"))?;
-    fs::write(
-        stage.join("webroot/index.html"),
-        include_str!("picters_webui.html"),
-    )?;
-    // Boot auto-load of the non-Wi-Fi drivers (CAN/BT/SDR/serial/NTFS/USB-eth) via a
-    // KernelSU/Magisk service.sh, plus the injection toggle scripts + Action fallback.
-    fs::write(stage.join("nh-modules.sh"), include_str!("mod_nh_modules.sh"))?;
-    fs::write(stage.join("service.sh"), include_str!("mod_service.sh"))?;
-    fs::write(stage.join("inject.sh"), include_str!("mod_inject.sh"))?;
+    // No WebUI, no boot auto-load: the .ko payload just sits in the systemless overlay
+    // at rest. The Picters Modules Manager app (system-app-injected above when built,
+    // opened via this module's Action button) is the sole control surface — it
+    // insmod/rmmod's these on demand via root, so every driver stays unloaded until
+    // the user toggles it.
     fs::write(stage.join("action.sh"), include_str!("mod_action.sh"))?;
 
     let out_zip = cwd.join(module_zip_name);

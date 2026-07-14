@@ -163,8 +163,8 @@
   "canoe": {
     "kernel_string": "Xiaomi17-NetHunter-Kokuban-Kernel",
     "device_check": true,
-    "modules": true,
-    "systemless": true,
+    "modules": false,
+    "systemless": false,
     "cleanup": true,
     "cleanup_on_abort": false,
     "device_names": [

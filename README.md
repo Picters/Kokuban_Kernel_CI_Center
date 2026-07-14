@@ -13,17 +13,24 @@ Every build publishes a release (on the kernel repo) with **two assets**:
 
 - **`Mi17_Kernel-…-ReSuki-…-susfs-….zip`** — the flashable kernel (AnyKernel3).
 - **`Mi17_Kernel-…-OOT-Modules-….zip`** — a **manager-agnostic** KernelSU/Magisk module
-  carrying the out-of-tree drivers (Wi-Fi injection, Bluetooth, CAN, SDR/DVB, NTFS) plus
-  the **Picters Manager** WebUI that toggles the injection Wi-Fi stack.
+  carrying the out-of-tree drivers (Wi-Fi injection, Bluetooth, CAN, SDR/DVB, NTFS). All
+  drivers stay unloaded on boot; the module's Action button opens the companion
+  **Picters Modules Manager** Android app, which insmod/rmmod's each driver on demand over
+  root. The APK itself is fetched from the app's own GitHub releases at build time
+  (`gh release download --repo Picters/picters_modules_manager`) and staged as a systemless
+  `/system/app` install — see `build_oot_module_zip()` in `ci_core_rs/src/build.rs`.
 
 Kernel repo: **[android_kernel_xiaomi_sm8850-nethunter](https://github.com/Picters/android_kernel_xiaomi_sm8850-nethunter)**
 — stock kernel on `main`, NetHunter on `resukisu`.
+App repo: **[picters_modules_manager](https://github.com/Picters/picters_modules_manager)** —
+separate Flutter project, its own release cadence, built independently of the kernel.
 
 ## Layout
 
 - `ci_core_rs/` — the Rust CI core. Parses `configs/projects.json`, runs the kernel build
   (`make`), merges the NetHunter defconfig fragment, builds & packages the out-of-tree
-  modules, assembles the OOT-Modules zip (WebUI + `action.sh`) and cuts the release.
+  modules, assembles the OOT-Modules zip (`action.sh` opens the manager app) and cuts
+  the release.
 - `configs/` — `projects.json` (per-device build metadata) and `anykernel_configs.json`.
 - `.github/workflows/` — **Build Kernel**, **Build CI Core**, and helper workflows.
 
