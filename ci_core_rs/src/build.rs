@@ -983,19 +983,19 @@ fn prepare_sm8850_build(
     update_kconfig_file(&defconfig_file, &entries)
 }
 
-/// Merge a NetHunter defconfig fragment on top of the freshly-generated
+/// Merge an extra-modules defconfig fragment on top of the freshly-generated
 /// out/.config. gki_defconfig itself is never modified so the frozen GKI KMI
 /// baseline stays intact; a later `olddefconfig` resolves the merged result.
-fn apply_nethunter_fragment(
+fn apply_extra_fragment(
     kernel_source_path: &Path,
     fragment_name: &str,
     build_env: &HashMap<String, String>,
 ) -> Result<()> {
     let fragment_rel = format!("arch/arm64/configs/{}", fragment_name);
     if !kernel_source_path.join(&fragment_rel).exists() {
-        return Err(anyhow!("NetHunter fragment not found: {}", fragment_rel));
+        return Err(anyhow!("Config fragment not found: {}", fragment_rel));
     }
-    println!("NetHunter: merging config fragment {}", fragment_rel);
+    println!("Modules: merging config fragment {}", fragment_rel);
     // -m keeps it a pure text merge (no make); build.rs runs olddefconfig after.
     run_cmd_with_env(
         &[
@@ -1012,7 +1012,7 @@ fn apply_nethunter_fragment(
     )
 }
 
-fn collect_nethunter_ko(
+fn collect_module_ko(
     dir: &Path,
     wanted: &HashSet<String>,
     dest: &Path,
@@ -1030,7 +1030,7 @@ fn collect_nethunter_ko(
             continue;
         }
         if file_type.is_dir() {
-            collect_nethunter_ko(&path, wanted, dest, all_built, packaged)?;
+            collect_module_ko(&path, wanted, dest, all_built, packaged)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("ko") {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 all_built.push(name.to_string());
@@ -1044,10 +1044,10 @@ fn collect_nethunter_ko(
     Ok(())
 }
 
-/// modules_install to a staging dir, then copy ONLY whitelisted NetHunter
+/// modules_install to a staging dir, then copy ONLY whitelisted extra
 /// modules into the AnyKernel3 systemless payload. Stock vendor/GKI modules are
 /// never shipped, so on-device MODVERSIONS stays consistent.
-fn package_nethunter_modules(
+fn package_extra_modules(
     kernel_source_path: &Path,
     anykernel_dir: &Path,
     modules_list_name: &str,
@@ -1080,7 +1080,7 @@ fn package_nethunter_modules(
 
     let list_path = kernel_source_path.join(format!("arch/arm64/configs/{}", modules_list_name));
     let list_content = fs::read_to_string(&list_path)
-        .map_err(|e| anyhow!("NetHunter module list {:?} unreadable: {}", list_path, e))?;
+        .map_err(|e| anyhow!("Module list {:?} unreadable: {}", list_path, e))?;
     let wanted: HashSet<String> = list_content
         .lines()
         .map(|l| l.trim())
@@ -1095,39 +1095,71 @@ fn package_nethunter_modules(
     let mut packaged = Vec::new();
     let modules_root = staging.join("lib/modules");
     if modules_root.exists() {
-        collect_nethunter_ko(&modules_root, &wanted, &dest, &mut all_built, &mut packaged)?;
+        collect_module_ko(&modules_root, &wanted, &dest, &mut all_built, &mut packaged)?;
     } else {
-        collect_nethunter_ko(&staging, &wanted, &dest, &mut all_built, &mut packaged)?;
+        collect_module_ko(&staging, &wanted, &dest, &mut all_built, &mut packaged)?;
     }
 
     all_built.sort();
     let _ = fs::write(
-        kernel_source_path.join("out/nethunter_built_modules.txt"),
+        kernel_source_path.join("out/extra_built_modules.txt"),
         all_built.join("\n"),
     );
     println!(
-        "NetHunter: packaged {} of {} whitelisted modules ({} built total)",
+        "Modules: packaged {} of {} whitelisted modules ({} built total)",
         packaged.len(),
         wanted.len(),
         all_built.len()
     );
     for m in &wanted {
         if !packaged.contains(m) {
-            println!("NetHunter: NOTE whitelisted module not built/found: {}", m);
+            println!("Modules: NOTE whitelisted module not built/found: {}", m);
         }
     }
     Ok(())
 }
 
+/// The module's boot `service.sh`: at late_start it insmods every staged driver
+/// EXCEPT the Wi-Fi injection stack. Wi-Fi (cfg80211/mac80211 + the adapter
+/// chipset drivers) conflicts with the stock vendor Wi-Fi and only comes up when
+/// the user switches to Inject mode in the app, so it stays unloaded here. insmod
+/// resolves no dependencies and there's no modules.dep on-device, so the loader
+/// loops until a full pass loads nothing new — a driver's deps come up before it.
+/// The skip-set mirrors `kWifiClassModules` in the app's module_repository.dart;
+/// keep the two in sync.
+fn build_boot_service() -> &'static str {
+    r#"#!/system/bin/sh
+# Picters Modules pack — load every staged driver at boot except the Wi-Fi
+# injection stack (it conflicts with the stock vendor Wi-Fi until the user
+# switches to Inject mode in the Picters Modules Manager app).
+MODDIR=/system/lib/modules
+[ -d "$MODDIR" ] || exit 0
+WIFI_SKIP="cfg80211 mac80211 88XXau 8188eu 8814au 88x2bu rtl8xxxu rtlwifi rtl_usb rtl8187 rtl8192cu rtl8192c-common ath ath9k_hw ath9k_common ath9k_htc ath6kl_core ath6kl_usb carl9170 mt7601u rt2x00lib rt2x00usb rt2800lib rt2800usb rt2500usb rt73usb zd1211rw usb_net_rndis_wlan"
+is_wifi() { for w in $WIFI_SKIP; do [ "$1" = "$w" ] && return 0; done; return 1; }
+progress=1; pass=0
+while [ "$progress" = 1 ] && [ "$pass" -lt 12 ]; do
+  progress=0; pass=$((pass + 1))
+  for ko in "$MODDIR"/*.ko; do
+    [ -e "$ko" ] || continue
+    base=$(basename "$ko" .ko)
+    is_wifi "$base" && continue
+    krname=$(echo "$base" | tr '-' '_')
+    grep -q "^$krname " /proc/modules && continue
+    insmod "$ko" 2>/dev/null && progress=1
+  done
+done
+"#
+}
+
 /// Assemble a standalone, manager-agnostic KernelSU/Magisk module zip carrying the
-/// NetHunter out-of-tree `.ko`. AnyKernel3's own `do_modules()` cannot deliver these
+/// extra out-of-tree `.ko`. AnyKernel3's own `do_modules()` cannot deliver these
 /// on a built-in-KSU kernel: it requires a `kernelsu_patched` marker that only exists
 /// when AnyKernel itself patches KSU into boot, it hardcodes the `me.weishu.kernelsu`
 /// package (ReSukiSU / KSU-Next / SukiSU-Ultra managers use randomized package names),
 /// and it gates on `/data/data/android`, which enforcing SELinux blocks in the flash
 /// context. So we ship the modules as a separate zip the user installs via ANY
 /// KernelSU-family or Magisk manager. Reuses the `.ko` already collected into
-/// `AnyKernel3/modules/system/lib/modules` by `package_nethunter_modules`.
+/// `AnyKernel3/modules/system/lib/modules` by `package_extra_modules`.
 /// Returns `Ok(true)` if a zip was produced.
 fn build_oot_module_zip(module_zip_name: &str, version_str: &str) -> Result<bool> {
     let cwd = env::current_dir()?;
@@ -1195,7 +1227,7 @@ fn build_oot_module_zip(module_zip_name: &str, version_str: &str) -> Result<bool
         true
     } else {
         println!(
-            "NetHunter: no PictersModulesManager.apk at {:?}, module zip will not carry the manager app",
+            "Modules: no PictersModulesManager.apk at {:?}, module zip will not carry the manager app",
             apk_src
         );
         false
@@ -1204,7 +1236,7 @@ fn build_oot_module_zip(module_zip_name: &str, version_str: &str) -> Result<bool
     fs::write(
         stage.join("module.prop"),
         format!(
-            "id=nethunter-oot-modules\nname=Picters Modules Manager\nversion={version_str}\nversionCode=1\nauthor=Picters\ndescription=Out-of-tree kernel modules (Wi-Fi injection adapters, BT, CAN, SDR/DVB, NTFS) for the matching NetHunter kernel. All modules stay unloaded until toggled from the Picters Modules Manager app — open it via this module's Action button.\n"
+            "id=picters-modules-pack\nname=Modules pack\nversion={version_str}\nversionCode=1\nauthor=Picters\ndescription=Extra kernel drivers — managed from the Picters Modules Manager app.\n"
         ),
     )?;
     let apk_ui_line = if apk_embedded {
@@ -1215,7 +1247,7 @@ fn build_oot_module_zip(module_zip_name: &str, version_str: &str) -> Result<bool
     fs::write(
         stage.join("customize.sh"),
         format!(
-            "#!/sbin/sh\nSKIPUNZIP=0\nui_print \"- Picters NetHunter OOT modules\"\nKO=$(ls \"$MODPATH/system/lib/modules/\"*.ko 2>/dev/null | wc -l)\nui_print \"- $KO drivers staged (unloaded by default)\"\nset_perm_recursive \"$MODPATH\" 0 0 0755 0644\n[ -f \"$MODPATH/action.sh\" ] && chmod 0755 \"$MODPATH/action.sh\"\n{apk_ui_line}ui_print \"- Use the module Action button to open Picters Modules Manager\"\n"
+            "#!/sbin/sh\nSKIPUNZIP=0\nui_print \"- Picters Modules pack\"\nKO=$(ls \"$MODPATH/system/lib/modules/\"*.ko 2>/dev/null | wc -l)\nui_print \"- $KO drivers staged (non-Wi-Fi load on boot)\"\nset_perm_recursive \"$MODPATH\" 0 0 0755 0644\nfor s in action.sh service.sh; do [ -f \"$MODPATH/$s\" ] && chmod 0755 \"$MODPATH/$s\"; done\n{apk_ui_line}ui_print \"- Use the module Action button to open Picters Modules Manager\"\n"
         ),
     )?;
     fs::write(
@@ -1227,12 +1259,14 @@ fn build_oot_module_zip(module_zip_name: &str, version_str: &str) -> Result<bool
         "#!/sbin/sh\numask 022\nOUTFD=$2\nZIPFILE=$3\nmount /data 2>/dev/null\nui_print() { echo \"$1\"; }\nif [ -f /data/adb/magisk/util_functions.sh ]; then\n  . /data/adb/magisk/util_functions.sh\n  install_module\n  exit 0\nfi\nui_print \"*** Install this zip from your KernelSU/Magisk manager (Modules > Install from storage) ***\"\nexit 1\n",
     )?;
 
-    // No WebUI, no boot auto-load: the .ko payload just sits in the systemless overlay
-    // at rest. The Picters Modules Manager app (system-app-injected above when built,
-    // opened via this module's Action button) is the sole control surface — it
-    // insmod/rmmod's these on demand via root, so every driver stays unloaded until
-    // the user toggles it.
+    // At boot, service.sh insmods every staged driver EXCEPT the Wi-Fi injection
+    // stack (cfg80211/mac80211 + the adapter chipset drivers): those conflict with
+    // the stock vendor Wi-Fi and only come up when the user switches to Inject mode
+    // in the app. The Picters Modules Manager app (system-app-injected above when
+    // built, opened via this module's Action button) is the control surface for
+    // toggling any driver on demand via root.
     fs::write(stage.join("action.sh"), include_str!("mod_action.sh"))?;
+    fs::write(stage.join("service.sh"), build_boot_service())?;
 
     let out_zip = cwd.join(module_zip_name);
     if out_zip.exists() {
@@ -1405,11 +1439,11 @@ fn patch_realtek_cfi(subdir: &Path) {
 
     for (i, &(_, _, label)) in rules.iter().enumerate() {
         if hits[i] > 0 {
-            println!("NetHunter OOT CFI patch: {} x{}", label, hits[i]);
+            println!("OOT CFI patch: {} x{}", label, hits[i]);
         }
     }
     if hits.iter().all(|&n| n == 0) {
-        println!("NetHunter OOT CFI patch: no patterns matched (already patched / non-Realtek)");
+        println!("OOT CFI patch: no patterns matched (already patched / non-Realtek)");
     }
 }
 
@@ -1495,11 +1529,11 @@ fn patch_realtek_ubsan(subdir: &Path) {
 
     for (i, &(_, _, label)) in rules.iter().enumerate() {
         if hits[i] > 0 {
-            println!("NetHunter OOT UBSAN patch: {} x{}", label, hits[i]);
+            println!("OOT UBSAN patch: {} x{}", label, hits[i]);
         }
     }
     if hits.iter().all(|&n| n == 0) {
-        println!("NetHunter OOT UBSAN patch: no patterns matched (already patched / non-Realtek)");
+        println!("OOT UBSAN patch: no patterns matched (already patched / non-Realtek)");
     }
 }
 
@@ -1508,7 +1542,7 @@ fn patch_realtek_ubsan(subdir: &Path) {
 /// 6.12) against the just-built kernel and drop their .ko into the AnyKernel3
 /// payload. BEST-EFFORT: any clone/build failure is logged and skipped so the
 /// core kernel still ships. Leaf modules -> no KMI impact.
-fn build_nethunter_oot_modules(
+fn build_extra_oot_modules(
     kernel_source_path: &Path,
     anykernel_dir: &Path,
     oot: &[OotModule],
@@ -1544,7 +1578,7 @@ fn build_nethunter_oot_modules(
                 let _ = fs::create_dir_all(parent);
             }
             let Some(subdir_str) = subdir_abs.to_str() else {
-                println!("NetHunter OOT: invalid path for {}, skipping", m.subdir);
+                println!("OOT: invalid path for {}, skipping", m.subdir);
                 continue;
             };
             let mut clone = vec!["git", "clone", "--depth=1"];
@@ -1555,7 +1589,7 @@ fn build_nethunter_oot_modules(
             clone.push(&m.repo);
             clone.push(subdir_str);
             if run_cmd(&clone, None, false).is_err() {
-                println!("NetHunter OOT: clone failed for {}, skipping", m.repo);
+                println!("OOT: clone failed for {}, skipping", m.repo);
                 continue;
             }
         }
@@ -1594,7 +1628,7 @@ fn build_nethunter_oot_modules(
             run_make_targets(kernel_source_path, &oot_env, &args, &["modules"], source_setup_env)
         {
             println!(
-                "NetHunter OOT: build failed for {} ({}), skipping",
+                "OOT: build failed for {} ({}), skipping",
                 m.subdir, err
             );
             continue;
@@ -1618,12 +1652,12 @@ fn build_nethunter_oot_modules(
                 );
                 if fs::copy(&path, dest.join(name)).is_ok() {
                     shipped += 1;
-                    println!("NetHunter OOT: packaged {}", name);
+                    println!("OOT: packaged {}", name);
                 }
             }
         }
         if shipped == 0 {
-            println!("NetHunter OOT: no .ko produced by {}", m.subdir);
+            println!("OOT: no .ko produced by {}", m.subdir);
         }
     }
     Ok(())
@@ -2001,8 +2035,8 @@ pub fn handle_build(
         is_sm8850,
     )?;
 
-    if let Some(fragment) = proj.nethunter_fragment.as_deref() {
-        apply_nethunter_fragment(&kernel_source_path, fragment, &build_env)?;
+    if let Some(fragment) = proj.extra_fragment.as_deref() {
+        apply_extra_fragment(&kernel_source_path, fragment, &build_env)?;
     }
 
     let mut disable_configs = vec!["TRIM_UNUSED_KSYMS"];
@@ -2116,7 +2150,7 @@ pub fn handle_build(
     let jobs = format!("-j{}", threads);
 
     if is_sm8850 {
-        let image_targets = if proj.nethunter_fragment.is_some() {
+        let image_targets = if proj.extra_fragment.is_some() {
             "Image modules"
         } else {
             "Image"
@@ -2157,8 +2191,8 @@ pub fn handle_build(
 
     fs::copy(image_path, "AnyKernel3/Image")?;
 
-    if let Some(modules_list) = proj.nethunter_modules.as_deref() {
-        package_nethunter_modules(
+    if let Some(modules_list) = proj.extra_modules.as_deref() {
+        package_extra_modules(
             &kernel_source_path,
             Path::new("AnyKernel3"),
             modules_list,
@@ -2167,12 +2201,12 @@ pub fn handle_build(
             is_sm8850,
         )?;
     }
-    if proj.nethunter_fragment.is_some() {
+    if proj.extra_fragment.is_some() {
         dump_kmi_baseline(&kernel_source_path);
     }
 
-    if let Some(oot) = proj.nethunter_oot_modules.as_deref() {
-        build_nethunter_oot_modules(
+    if let Some(oot) = proj.extra_oot_modules.as_deref() {
+        build_extra_oot_modules(
             &kernel_source_path,
             Path::new("AnyKernel3"),
             oot,
@@ -2227,8 +2261,8 @@ pub fn handle_build(
         false,
     )?;
 
-    // Standalone, manager-agnostic OOT-modules zip (NetHunter projects only).
-    let module_zip_name: Option<String> = if proj.nethunter_fragment.is_some() {
+    // Standalone, manager-agnostic OOT-modules zip (extra-modules projects only).
+    let module_zip_name: Option<String> = if proj.extra_fragment.is_some() {
         let name = format!(
             "{}-OOT-Modules-{}{}-{}.zip",
             zip_prefix, clean_localversion, feature_suffix, date_str
@@ -2236,15 +2270,15 @@ pub fn handle_build(
         let version_str = format!("{}-{}", kernel_version, clean_localversion);
         match build_oot_module_zip(&name, &version_str) {
             Ok(true) => {
-                println!("NetHunter: built standalone OOT module zip {}", name);
+                println!("Modules: built standalone OOT module zip {}", name);
                 Some(name)
             }
             Ok(false) => {
-                println!("NetHunter: no OOT .ko found, skipping module zip");
+                println!("Modules: no OOT .ko found, skipping module zip");
                 None
             }
             Err(e) => {
-                println!("NetHunter: WARN could not build OOT module zip: {}", e);
+                println!("Modules: WARN could not build OOT module zip: {}", e);
                 None
             }
         }
@@ -2315,7 +2349,7 @@ pub fn handle_collect_artifacts(artifact_dir: String) -> Result<()> {
         "kernel_source/out/.config",
         "kernel_source/out/vmlinux.symvers",
         "kernel_source/out/Module.symvers",
-        "kernel_source/out/nethunter_built_modules.txt",
+        "kernel_source/out/extra_built_modules.txt",
     ] {
         has_artifacts |= copy_artifact_if_exists(Path::new(extra_artifact), &artifact_dir)?;
     }

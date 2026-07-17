@@ -531,9 +531,9 @@ fn handle_add(options: AddOptions) -> Result<()> {
         susfs: None,
         bbg: None,
         watch_upstream_variants: None,
-        nethunter_fragment: None,
-        nethunter_modules: None,
-        nethunter_oot_modules: None,
+        extra_fragment: None,
+        extra_modules: None,
+        extra_oot_modules: None,
     };
 
     projects.insert(options.key, serde_json::to_value(new_proj)?);

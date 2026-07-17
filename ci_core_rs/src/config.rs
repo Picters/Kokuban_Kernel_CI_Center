@@ -21,14 +21,14 @@ pub struct ProjectConfig {
     pub susfs: Option<SusfsConfig>,
     pub bbg: Option<BbgConfig>,
     pub watch_upstream_variants: Option<Vec<String>>,
-    // NetHunter: defconfig fragment merged on top of `defconfig`, and the
+    // Extra modules: defconfig fragment merged on top of `defconfig`, and the
     // whitelist of module basenames packaged into the AnyKernel3 payload.
-    pub nethunter_fragment: Option<String>,
-    pub nethunter_modules: Option<String>,
+    pub extra_fragment: Option<String>,
+    pub extra_modules: Option<String>,
     // Out-of-tree Wi-Fi injection drivers (aircrack rtl8812au/8814au/8188eus)
     // cloned + built best-effort against the just-built kernel; failures are
     // logged and never abort the main build.
-    pub nethunter_oot_modules: Option<Vec<OotModule>>,
+    pub extra_oot_modules: Option<Vec<OotModule>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

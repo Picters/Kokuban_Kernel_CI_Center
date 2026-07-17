@@ -27,9 +27,9 @@
     "lto": "none",
     "anykernel_config": "canoe",
     "zip_name_prefix": "Mi17_Kernel",
-    "nethunter_fragment": "nethunter.fragment",
-    "nethunter_modules": "nethunter_modules.list",
-    "nethunter_oot_modules": [
+    "extra_fragment": "extra.fragment",
+    "extra_modules": "extra_modules.list",
+    "extra_oot_modules": [
       {
         "repo": "https://github.com/aircrack-ng/rtl8812au.git",
         "subdir": "drivers/net/wireless/aircrack/rtl8812au",
