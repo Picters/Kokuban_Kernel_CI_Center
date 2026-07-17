@@ -1132,6 +1132,10 @@ fn build_boot_service() -> &'static str {
 # Picters Modules pack — load every staged driver at boot except the Wi-Fi
 # injection stack (it conflicts with the stock vendor Wi-Fi until the user
 # switches to Inject mode in the Picters Modules Manager app).
+# Off by default: the app writes/removes BOOT_FLAG, outside /data/adb/modules
+# so it survives a Modules pack reinstall/update.
+BOOT_FLAG=/data/adb/picters_modules_manager/boot_load_enabled
+[ -f "$BOOT_FLAG" ] || exit 0
 MODDIR=/system/lib/modules
 [ -d "$MODDIR" ] || exit 0
 WIFI_SKIP="cfg80211 mac80211 88XXau 8188eu 8814au 88x2bu rtl8xxxu rtlwifi rtl_usb rtl8187 rtl8192cu rtl8192c-common ath ath9k_hw ath9k_common ath9k_htc ath6kl_core ath6kl_usb carl9170 mt7601u rt2x00lib rt2x00usb rt2800lib rt2800usb rt2500usb rt73usb zd1211rw usb_net_rndis_wlan"
