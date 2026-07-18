@@ -1240,7 +1240,7 @@ fn build_oot_module_zip(module_zip_name: &str, version_str: &str) -> Result<bool
     fs::write(
         stage.join("module.prop"),
         format!(
-            "id=picters-modules-pack\nname=Modules pack\nversion={version_str}\nversionCode=1\nauthor=Picters\ndescription=Extra kernel drivers — managed from the Picters Modules Manager app.\n"
+            "id=picters-modules-pack\nname=Picters Modules Pack\nversion={version_str}\nversionCode=1\nauthor=Picters\ndescription=Extra kernel drivers — managed from the Picters Modules Manager app.\n"
         ),
     )?;
     let apk_ui_line = if apk_embedded {
@@ -1497,7 +1497,9 @@ fn patch_realtek_cfi(subdir: &Path) {
 /// already does (loop bound, `len` param, `ret_len` field) remains the
 /// actual (runtime) bounds check it always relied on.
 fn patch_realtek_ubsan(subdir: &Path) {
-    let rules: [(&str, &str, &str); 4] = [
+    // Last two rules guard the group-key MIC copies with an is-TKIP check: CCMP
+    // GTKs are 16B, so key[16]/key[24] index past crypt.key[0] -> UBSAN panic.
+    let rules: [(&str, &str, &str); 6] = [
         ("UCHAR  data[1];", "UCHAR  data[];", "var-ie-flexarray"),
         (
             "u8\t\tData[1]; /* byte1 is extension event code */",
@@ -1510,12 +1512,22 @@ fn patch_realtek_ubsan(subdir: &Path) {
             "u1Byte\tdata[];",
             "col-c2h-ind-data-flexarray",
         ),
+        (
+            "_rtw_memcpy(padapter->securitypriv.dot118021XGrptxmickey[param->u.crypt.idx].skey, &(param->u.crypt.key[16]), 8);",
+            "if (strcmp(param->u.crypt.alg, \"TKIP\") == 0) _rtw_memcpy(padapter->securitypriv.dot118021XGrptxmickey[param->u.crypt.idx].skey, param->u.crypt.key + 16, 8);",
+            "grpkey-txmic-tkip-guard",
+        ),
+        (
+            "_rtw_memcpy(padapter->securitypriv.dot118021XGrprxmickey[param->u.crypt.idx].skey, &(param->u.crypt.key[24]), 8);",
+            "if (strcmp(param->u.crypt.alg, \"TKIP\") == 0) _rtw_memcpy(padapter->securitypriv.dot118021XGrprxmickey[param->u.crypt.idx].skey, param->u.crypt.key + 24, 8);",
+            "grpkey-rxmic-tkip-guard",
+        ),
     ];
 
     let mut files = Vec::new();
     collect_c_sources(subdir, &mut files);
 
-    let mut hits = [0usize; 4];
+    let mut hits = [0usize; 6];
     for file in files {
         let Ok(content) = fs::read_to_string(&file) else {
             continue;
