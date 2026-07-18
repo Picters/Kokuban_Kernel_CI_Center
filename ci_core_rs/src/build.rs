@@ -1387,16 +1387,26 @@ fn collect_c_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Both are `static`, so unlike `rtw_xmit_entry` there is no header `extern`
 /// copy to patch — the definition line is the only occurrence.
 fn patch_realtek_cfi(subdir: &Path) {
-    let rules: [(&str, &str, &str); 6] = [
+    let rules: [(&str, &str, &str); 7] = [
+        // Suffix match: catches usb_recv_tasklet AND every per-chip
+        // rtl8*_recv_tasklet (PCIe/SDIO HALs) with one rule, so a future
+        // defconfig that compiles another chip's HAL is pre-adapted.
         (
-            "usb_recv_tasklet(void *priv)",
-            "usb_recv_tasklet(unsigned long priv)",
+            "_recv_tasklet(void *priv)",
+            "_recv_tasklet(unsigned long priv)",
             "recv-tasklet",
         ),
         (
             "_xmit_tasklet(void *priv)",
             "_xmit_tasklet(unsigned long priv)",
             "xmit-tasklet",
+        ),
+        // Beacon tasklets: same tasklet ->func(unsigned long) call, same
+        // (void *priv) prototype mismatch; PCIe-HAL-only today, adapted anyway.
+        (
+            "_prepare_bcn_tasklet(void *priv)",
+            "_prepare_bcn_tasklet(unsigned long priv)",
+            "bcn-tasklet",
         ),
         (
             "mpath_tx_tasklet_hdl(void *priv)",
@@ -1423,7 +1433,7 @@ fn patch_realtek_cfi(subdir: &Path) {
     let mut files = Vec::new();
     collect_c_sources(subdir, &mut files);
 
-    let mut hits = [0usize; 6];
+    let mut hits = [0usize; 7];
     for file in files {
         let Ok(content) = fs::read_to_string(&file) else {
             continue;
