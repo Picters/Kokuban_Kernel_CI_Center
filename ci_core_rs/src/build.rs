@@ -1498,21 +1498,13 @@ fn patch_realtek_cfi(subdir: &Path) {
 /// actual (runtime) bounds check it always relied on.
 fn patch_realtek_ubsan(subdir: &Path) {
     let rules: [(&str, &str, &str); 4] = [
-        (
-            "UCHAR  data[1];",
-            "UCHAR  data[];",
-            "var-ie-flexarray",
-        ),
+        ("UCHAR  data[1];", "UCHAR  data[];", "var-ie-flexarray"),
         (
             "u8\t\tData[1]; /* byte1 is extension event code */",
             "u8\t\tData[]; /* byte1 is extension event code */",
             "hci-event-data-flexarray",
         ),
-        (
-            "u1Byte\tbuf[1];",
-            "u1Byte\tbuf[];",
-            "col-h2c-buf-flexarray",
-        ),
+        ("u1Byte\tbuf[1];", "u1Byte\tbuf[];", "col-h2c-buf-flexarray"),
         (
             "u1Byte\tdata[1];",
             "u1Byte\tdata[];",
@@ -1550,6 +1542,7 @@ fn patch_realtek_ubsan(subdir: &Path) {
         println!("OOT UBSAN patch: no patterns matched (already patched / non-Realtek)");
     }
 }
+
 
 /// Clone + build the out-of-tree aircrack Wi-Fi injection drivers
 /// (rtl8812au/8814au/8188eus for RTL8812AU/8814AU chips absent from in-tree
