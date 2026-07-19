@@ -1165,7 +1165,21 @@ done
 /// KernelSU-family or Magisk manager. Reuses the `.ko` already collected into
 /// `AnyKernel3/modules/system/lib/modules` by `package_extra_modules`.
 /// Returns `Ok(true)` if a zip was produced.
-fn build_oot_module_zip(module_zip_name: &str, version_str: &str) -> Result<bool> {
+/// Packs a monotonic int32 versionCode from a "YYYYMMDD-HHMM" build stamp so the
+/// app can tell which modules build is installed: (YYYYMMDD-20200000)*10000+HHMM
+/// (minute-granular, fits i32 until ~2041). Returns 1 if the stamp is unparseable.
+fn module_version_code(date_str: &str) -> u64 {
+    let digits: String = date_str.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() >= 12 {
+        let ymd: u64 = digits[0..8].parse().unwrap_or(20200000);
+        let hhmm: u64 = digits[8..12].parse().unwrap_or(0);
+        ymd.saturating_sub(20200000) * 10000 + hhmm
+    } else {
+        1
+    }
+}
+
+fn build_oot_module_zip(module_zip_name: &str, version_str: &str, date_str: &str) -> Result<bool> {
     let cwd = env::current_dir()?;
     let ko_src = cwd.join("AnyKernel3/modules/system/lib/modules");
     if !ko_src.exists() {
@@ -1237,10 +1251,13 @@ fn build_oot_module_zip(module_zip_name: &str, version_str: &str) -> Result<bool
         false
     };
 
+    // versionCode is a monotonic build stamp (see module_version_code); the app
+    // compares it against the latest release to gate features on a matching kernel.
+    let version_code = module_version_code(date_str);
     fs::write(
         stage.join("module.prop"),
         format!(
-            "id=picters-modules-pack\nname=Picters Modules Pack\nversion={version_str}\nversionCode=1\nauthor=Picters\ndescription=Extra kernel drivers — managed from the Picters Modules Manager app.\n"
+            "id=picters-modules-pack\nname=Picters Modules Pack\nversion={version_str}-{date_str}\nversionCode={version_code}\nauthor=Picters\ndescription=Extra kernel drivers — managed from the Picters Modules Manager app.\n"
         ),
     )?;
     let apk_ui_line = if apk_embedded {
@@ -2327,7 +2344,7 @@ pub fn handle_build(
             zip_prefix, clean_localversion, feature_suffix, date_str
         );
         let version_str = format!("{}-{}", kernel_version, clean_localversion);
-        match build_oot_module_zip(&name, &version_str) {
+        match build_oot_module_zip(&name, &version_str, &date_str) {
             Ok(true) => {
                 println!("Modules: built standalone OOT module zip {}", name);
                 Some(name)
