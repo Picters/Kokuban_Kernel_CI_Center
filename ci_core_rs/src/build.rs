@@ -1555,6 +1555,38 @@ fn patch_realtek_ubsan(subdir: &Path) {
     }
 }
 
+/// Guard the STA connect-result path against a cfg80211 NULL-pointer panic.
+/// rtl8812au's (-> 88XXau.ko) rtw_cfg80211_indicate_connect() calls
+/// cfg80211_get_bss(); on a weak/aged AP that returns NULL, then hands
+/// cfg80211_connect_bss() a NULL bss with WLAN_STATUS_SUCCESS, which NULL-derefs
+/// in __cfg80211_connect_result on 6.12 (seen on-device via last_kmsg). Fix:
+/// inform the BSS from cur_network first so get_bss finds it, and bail cleanly
+/// if it's still NULL. Only the aircrack rtl8812au fork has this block; the
+/// morrownr forks (8814au/88x2bu) indicate connect differently and are fine.
+fn patch_realtek_connect_null_bss(subdir: &Path) {
+    let needle = "                        struct cfg80211_bss *bss;\n                        bss = cfg80211_get_bss(pwdev->wiphy, NULL, cur_network->network.MacAddress, NULL, 0,\n                                IEEE80211_BSS_TYPE_ANY, IEEE80211_PRIVACY_ANY);";
+    let repl = "                        struct cfg80211_bss *bss = NULL;\n                        rtw_cfg80211_inform_bss(padapter, cur_network);\n                        bss = cfg80211_get_bss(pwdev->wiphy, NULL,\n                                cur_network->network.MacAddress, NULL, 0,\n                                IEEE80211_BSS_TYPE_ANY, IEEE80211_PRIVACY_ANY);\n                        if (bss == NULL) {\n                                RTW_INFO(\"rtw: no bss for connect, skip to avoid cfg80211 NULL deref\\n\");\n                                rtw_wdev_free_connect_req(pwdev_priv);\n                                _exit_critical_bh(&pwdev_priv->connect_req_lock, &irqL);\n                                return;\n                        }";
+
+    let mut files = Vec::new();
+    collect_c_sources(subdir, &mut files);
+    let mut hits = 0usize;
+    for file in files {
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let n = content.matches(needle).count();
+        if n > 0 {
+            hits += n;
+            let _ = fs::write(&file, content.replace(needle, repl));
+        }
+    }
+    if hits > 0 {
+        println!("OOT connect-bss NULL guard: x{}", hits);
+    } else {
+        println!("OOT connect-bss NULL guard: no pattern (already patched / non-aircrack)");
+    }
+}
+
 
 /// Clone + build the out-of-tree aircrack Wi-Fi injection drivers
 /// (rtl8812au/8814au/8188eus for RTL8812AU/8814AU chips absent from in-tree
@@ -1633,6 +1665,10 @@ fn build_extra_oot_modules(
         // during a normal 802.11 association (e.g. wpa_supplicant-driven
         // tools like OneShot).
         patch_realtek_ubsan(&subdir_abs);
+
+        // Guard the connect-result path: rtl8812au hands cfg80211 a NULL bss on
+        // a weak/aged AP, NULL-derefing __cfg80211_connect_result on 6.12.
+        patch_realtek_connect_null_bss(&subdir_abs);
 
         let m_arg = format!("M={}", subdir_abs.display());
         let mut args: Vec<&str> = make_args.to_vec();
