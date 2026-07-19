@@ -1497,9 +1497,12 @@ fn patch_realtek_cfi(subdir: &Path) {
 /// already does (loop bound, `len` param, `ret_len` field) remains the
 /// actual (runtime) bounds check it always relied on.
 fn patch_realtek_ubsan(subdir: &Path) {
-    // Last two rules guard the group-key MIC copies with an is-TKIP check: CCMP
-    // GTKs are 16B, so key[16]/key[24] index past crypt.key[0] -> UBSAN panic.
-    let rules: [(&str, &str, &str); 6] = [
+    // The key[0]->key[] rule is the catch-all: aircrack declares ieee_param's
+    // crypt.key as u8 key[0], so EVERY key[16]/key[24] MIC read (group AND the
+    // pairwise dot11tkip*mickey copies) is UBSAN-instrumented and panics on a
+    // TKIP handshake. morrownr uses key[] (flex array, UBSAN-exempt) and never
+    // panics — match that. The two TKIP guards below stay as belt-and-braces.
+    let rules: [(&str, &str, &str); 7] = [
         ("UCHAR  data[1];", "UCHAR  data[];", "var-ie-flexarray"),
         (
             "u8\t\tData[1]; /* byte1 is extension event code */",
@@ -1512,6 +1515,7 @@ fn patch_realtek_ubsan(subdir: &Path) {
             "u1Byte\tdata[];",
             "col-c2h-ind-data-flexarray",
         ),
+        ("u8 key[0];", "u8 key[];", "crypt-key-flexarray"),
         (
             "_rtw_memcpy(padapter->securitypriv.dot118021XGrptxmickey[param->u.crypt.idx].skey, &(param->u.crypt.key[16]), 8);",
             "if (strcmp(param->u.crypt.alg, \"TKIP\") == 0) _rtw_memcpy(padapter->securitypriv.dot118021XGrptxmickey[param->u.crypt.idx].skey, param->u.crypt.key + 16, 8);",
@@ -1527,7 +1531,7 @@ fn patch_realtek_ubsan(subdir: &Path) {
     let mut files = Vec::new();
     collect_c_sources(subdir, &mut files);
 
-    let mut hits = [0usize; 6];
+    let mut hits = [0usize; 7];
     for file in files {
         let Ok(content) = fs::read_to_string(&file) else {
             continue;
