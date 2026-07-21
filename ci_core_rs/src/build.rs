@@ -1119,22 +1119,50 @@ fn package_extra_modules(
     Ok(())
 }
 
-/// The module's boot `service.sh`: at late_start it insmods every staged driver
-/// EXCEPT the Wi-Fi injection stack. Wi-Fi (cfg80211/mac80211 + the adapter
-/// chipset drivers) conflicts with the stock vendor Wi-Fi and only comes up when
-/// the user switches to Inject mode in the app, so it stays unloaded here. insmod
-/// resolves no dependencies and there's no modules.dep on-device, so the loader
-/// loops until a full pass loads nothing new — a driver's deps come up before it.
-/// The skip-set mirrors `kWifiClassModules` in the app's module_repository.dart;
-/// keep the two in sync.
+/// The module's boot `service.sh` (late_start). Two independent, opt-in features,
+/// each gated by its own flag the app writes under /data/adb/picters_modules_manager
+/// (outside /data/adb/modules, so they survive a pack update):
+///   * CPU/GPU performance caps (perf.conf) — applied in the background with a
+///     delayed re-apply so the vendor perf HAL doesn't clobber the frequency cap.
+///     Every value was validated against the hardware OPP table by the app, so it
+///     only ever writes real, in-range frequencies (never above stock).
+///   * insmod every staged driver EXCEPT the Wi-Fi injection stack (boot_load_enabled).
+/// Wi-Fi (cfg80211/mac80211 + adapter chipset drivers) conflicts with the stock
+/// vendor Wi-Fi and only comes up when the user switches to Inject mode, so it stays
+/// unloaded here. insmod resolves no deps and there's no modules.dep on-device, so
+/// the loader loops until a full pass loads nothing new. The skip-set mirrors
+/// `kWifiClassModules` in the app's module_repository.dart; keep the two in sync.
 fn build_boot_service() -> &'static str {
     r#"#!/system/bin/sh
-# Picters Modules pack — load every staged driver at boot except the Wi-Fi
-# injection stack (it conflicts with the stock vendor Wi-Fi until the user
-# switches to Inject mode in the Picters Modules Manager app).
-# Off by default: the app writes/removes BOOT_FLAG, outside /data/adb/modules
-# so it survives a Modules pack reinstall/update.
-BOOT_FLAG=/data/adb/picters_modules_manager/boot_load_enabled
+# Picters Modules pack boot service. Both features below are opt-in, gated by
+# flags the app writes under $CONFDIR (outside /data/adb/modules, so they survive
+# a pack update). Removing the module reverts everything to stock.
+CONFDIR=/data/adb/picters_modules_manager
+
+# --- CPU/GPU performance caps (perf.conf) ---------------------------------
+# The vendor perf HAL (perfd) OWNS scaling_max_freq and rewrites it on load /
+# thermal events, so a one-shot cap doesn't hold. Re-apply on a loop to keep the
+# ceiling pinned. The app only ever writes real OPP-table frequencies (never
+# above stock). pmm_apply_perf returns non-zero once the app clears the flag, so
+# the loop exits cleanly. Runs in the background so it never blocks boot.
+PERF_CONF=$CONFDIR/perf.conf
+pmm_apply_perf() {
+  [ -f "$PERF_CONF" ] || return 1
+  en=0
+  while read -r k a _; do [ "$k" = "enabled" ] && en="$a"; done < "$PERF_CONF"
+  [ "$en" = "1" ] || return 1
+  while read -r k a b; do
+    case "$k" in
+      cpu) [ -n "$b" ] && [ -e "$a/scaling_max_freq" ] && echo "$b" > "$a/scaling_max_freq" 2>/dev/null ;;
+      gpu) [ -n "$a" ] && [ -e /sys/class/kgsl/kgsl-3d0/max_gpuclk ] && echo "$a" > /sys/class/kgsl/kgsl-3d0/max_gpuclk 2>/dev/null ;;
+    esac
+  done < "$PERF_CONF"
+  return 0
+}
+( sleep 20; while pmm_apply_perf; do sleep 10; done ) &
+
+# --- Load staged drivers except the Wi-Fi injection stack (boot_load_enabled) -
+BOOT_FLAG=$CONFDIR/boot_load_enabled
 [ -f "$BOOT_FLAG" ] || exit 0
 MODDIR=/system/lib/modules
 [ -d "$MODDIR" ] || exit 0
