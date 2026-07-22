@@ -1432,7 +1432,7 @@ fn collect_c_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Both are `static`, so unlike `rtw_xmit_entry` there is no header `extern`
 /// copy to patch — the definition line is the only occurrence.
 fn patch_realtek_cfi(subdir: &Path) {
-    let rules: [(&str, &str, &str); 7] = [
+    let rules: [(&str, &str, &str); 8] = [
         // Suffix match: catches usb_recv_tasklet AND every per-chip
         // rtl8*_recv_tasklet (PCIe/SDIO HALs) with one rule, so a future
         // defconfig that compiles another chip's HAL is pre-adapted.
@@ -1473,12 +1473,35 @@ fn patch_realtek_cfi(subdir: &Path) {
             "netdev_tx_t mgnt_xmit_entry(struct sk_buff *skb, struct net_device *pnetdev)",
             "mgnt-xmit",
         ),
+        // The RTW command thread's generic "run this function in the cmd thread"
+        // dispatcher. `run_in_thread_hdl` does `p->func(p->context)` where `func`
+        // is a `void(*)(void *)` (struct RunInThread_param), but every caller
+        // stores a DIFFERENTLY-typed function pointer into it via a `(void *)`
+        // cast — `rtw_hal_update_txpwr_level(_adapter *)`, `rtw_hal_update_tx_aclt`,
+        // `rtw_update_tx_rate_bmp`, `phy_reload_*_tx_power_ext_info`, etc. (8
+        // distinct target types across the forks). kCFI keys on the target
+        // function's own emitted type-id, not the pointer's static type, so the
+        // `(void *)` cast doesn't help: the indirect call traps the moment any
+        // of them actually runs. Diagnosed on-device via last_kmsg setting tx
+        // power on an RTL8822BU: "CFI failure at run_in_thread_hdl+0x30/0x5c
+        // [88x2bu] (target: rtw_hal_update_txpwr_level ...; expected type
+        // 0x0ef81b7d), Comm: RTW_CMD_THREAD, Kernel panic - CFI: Fatal
+        // exception". Rather than wrap all 8 targets, exempt the ONE dispatcher's
+        // indirect call from kCFI with __nocfi — its direct callers are unaffected
+        // and it fixes every current + future run_in_thread callback at once.
+        // (Matches the definition in rtw_mlme_ext.c and, harmlessly, the matching
+        // header prototype — keeping the two consistent.)
+        (
+            "u8 run_in_thread_hdl(_adapter *padapter, u8 *pbuf)",
+            "u8 __nocfi run_in_thread_hdl(_adapter *padapter, u8 *pbuf)",
+            "run-in-thread-nocfi",
+        ),
     ];
 
     let mut files = Vec::new();
     collect_c_sources(subdir, &mut files);
 
-    let mut hits = [0usize; 7];
+    let mut hits = [0usize; 8];
     for file in files {
         let Ok(content) = fs::read_to_string(&file) else {
             continue;
